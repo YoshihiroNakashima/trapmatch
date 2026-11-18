@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrapMatch</title>
+<link rel="icon" type="image/png" href="/static/icon.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header id="top">
+  <div class="brand">TrapMatch<span id="ver"></span></div>
+  <label class="seasonbox">Season
+    <input id="season" list="seasonList" autocomplete="off" spellcheck="false" placeholder="選ぶか入力">
+    <datalist id="seasonList"></datalist>
+  </label>
+  <button id="btnScan" class="primary">走査</button>
+  <span id="scanInfo" class="muted"></span>
+  <div class="spacer"></div>
+  <button id="btnSummary">集計</button>
+  <button id="btnExport">書き出し</button>
+  <button id="btnSettings">保存場所と設定</button>
+</header>
+
+<div id="jobbar" hidden>
+  <span id="jobText"></span>
+  <div class="meter"><div id="jobFill"></div></div>
+</div>
+<div id="verNotice" hidden></div>
+<div id="notice" hidden></div>
+
+<main>
+  <aside id="left">
+    <div class="filters">
+      <label class="toggle strong"><input type="checkbox" id="fMismatch"><span>不一致のみ</span><b id="cMismatch"></b></label>
+      <label class="toggle"><input type="checkbox" id="fUndecided"><span>未判断のみ</span><b id="cUndecided"></b></label>
+      <label class="toggle" title="絞り込んだ一覧に、連続する動画の一つ前と一つ後の動画を足します。足した動画の判断は変えられません。"><input type="checkbox" id="fContext"><span>前後の動画も表示</span></label>
+
+      <div class="gtitle">保存場所の組で絞る</div>
+      <div id="pairs" class="chips"></div>
+
+      <div class="gtitle">状態</div>
+      <div id="states" class="chips"></div>
+
+      <div class="gtitle">所在パターン</div>
+      <div id="patterns"></div>
+
+      <input id="fSearch" type="search" placeholder="ファイル名で検索" spellcheck="false">
+      <button id="btnClear" class="link">すべて表示（絞り込みを解除）</button>
+    </div>
+    <div class="gtitle pad">Station</div>
+    <div id="stationList"></div>
+  </aside>
+
+  <section id="center">
+    <div id="toolbar">
+      <span id="viewCount"></span>
+      <div class="spacer"></div>
+      <span class="muted" id="bulkLabel">表示中の動画にまとめて:</span>
+      <button data-bulk="k">残す</button>
+      <button data-bulk="d">削除する</button>
+      <button data-bulk="e">例外</button>
+      <button data-bulk="">未判断</button>
+      <button id="btnUndo" disabled>元に戻す</button>
+    </div>
+    <div id="thead"></div>
+    <div id="tbody" tabindex="0">
+      <div id="spacer"></div>
+      <div id="rows"></div>
+      <div id="empty" hidden></div>
+    </div>
+  </section>
+
+  <aside id="right">
+    <div id="stage">
+      <video id="vid" controls muted playsinline hidden></video>
+      <canvas id="cv" hidden></canvas>
+      <div id="stageMsg">一覧の動画を選ぶと、ここで再生します</div>
+    </div>
+    <div id="mjbar" hidden>
+      <button id="mjPlay" title="再生と停止（スペース）">停止</button>
+      <input type="range" id="mjSeek" min="0" max="0" value="0" step="1">
+      <span id="mjTime" class="num"></span>
+    </div>
+    <div id="pbar">
+      <div id="srcBtns" class="seg"></div>
+      <div class="spacer"></div>
+      <div class="seg" id="speedBtns" title="再生の速度（1、2、4 キー）">
+        <button data-speed="1" class="on">1 倍</button><button data-speed="2">2 倍</button><button data-speed="4">4 倍</button>
+      </div>
+    </div>
+    <div id="detail"></div>
+  </aside>
+</main>
+
+<footer id="status"></footer>
+
+<div id="modal" hidden><div id="modalBox" role="dialog" aria-modal="true"></div></div>
+<div id="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

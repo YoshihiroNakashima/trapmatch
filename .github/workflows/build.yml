@@ -1,0 +1,112 @@
+# 試験、TrapMatch.exe の作成と動作確認、Releases への掲載。
+#   main への push と pull request: 試験と exe の作成（exe は Actions の成果物として 2 週間残る）
+#   v0.2.0 のような tag の push:    上に加えて、作った exe を Releases に載せる
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: 試験（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: 試験に使うものを入れる
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pillow imageio-ffmpeg
+          python packaging/ci_ffmpeg.py "$RUNNER_TEMP/ffmpeg-bin"
+      - name: 試験
+        run: python -m pytest -q
+
+  exe:
+    name: TrapMatch.exe を作る
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: tag と版が合っているか確かめる
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(python -c "import tm_core; print(tm_core.VERSION)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag（$GITHUB_REF_NAME）とプログラムの版（$version）が違います"
+            exit 1
+          fi
+      - name: 作るのに使うものを入れる
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller==6.22.3 pillow imageio-ffmpeg
+          python packaging/ci_ffmpeg.py "$RUNNER_TEMP/ffmpeg-bin"
+      - name: exe を作る
+        run: python packaging/build_exe.py
+      - name: 作った exe を動かして確かめる
+        run: python packaging/smoke_test.py dist/TrapMatch.exe
+      - name: SHA256 を記録する
+        run: |
+          cd dist
+          sha256sum TrapMatch.exe > TrapMatch.exe.sha256
+          cat TrapMatch.exe.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: TrapMatch-windows
+          path: |
+            dist/TrapMatch.exe
+            dist/TrapMatch.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Releases に載せる
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: TrapMatch-windows
+          path: dist
+      - name: Releases に載せる
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 packaging/release_notes.py "$GITHUB_REF_NAME" > notes.md
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/TrapMatch.exe dist/TrapMatch.exe.sha256 --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" dist/TrapMatch.exe dist/TrapMatch.exe.sha256 \
+              --title "TrapMatch ${GITHUB_REF_NAME#v}" --notes-file notes.md
+          fi

@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+# 実行ファイルを作るときの作業場所と出力
+build/
+dist/
+*.spec
+# 試験で作ったもの
+shots/
