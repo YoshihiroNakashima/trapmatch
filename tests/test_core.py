@@ -956,11 +956,16 @@ def test_added_row_defaults(tmp_path):
     want = {'Season_sub_folder': S, 'DeleteFlag': 'FALSE', 'Pass': 'TRUE', 'Star': 'FALSE', 'Remarks': 'NA',
             'PassCount': '0', 'Indep': 'TRUE', 'LeftCens': 'FALSE', 'RightCens': 'FALSE',
             'StartTime': '999.9', 'EndTime': '999.9', 'Species': 'Add'}
-    assert {hdr[int(i)]: v for i, v in p['csv']['defaults'].items()} == want
+    # 動画ごとに違う値（Season フォルダの名前）は、一覧では説明の文にして、動画の詳細で実際の値を返す
+    shown = dict(want, Season_sub_folder=tm_core.FOLDER_LABEL)
+    assert {hdr[int(i)]: v for i, v in p['csv']['defaults'].items()} == shown
     c = tm_core.csv_change_counts(store, S)
-    assert c['add_defaults'] == [[h, want[h]] for h in hdr if h in want]      # 見出しの順
+    assert c['add_defaults'] == [[h, shown[h]] for h in hdr if h in shown]    # 見出しの順
     i31 = by_name(p)[('BSN1053', 'IMG_0031')][0]
     i32 = by_name(p)[('BSN1053', 'IMG_0032')][0]
+    d = tm_core.item_detail(store, S, i31)
+    assert {hdr[int(i)]: v for i, v in d['defaults'].items()} == want
+    assert [f['folder'] for x in d['sources'] if x['type'] == 'folder' for f in x['files']] == [S, S]
     tm_core.set_decision(store, S, [i31, i32], 'keep')
     # 行ごとの入力は既定値より優先する。入力のない列は既定値のまま
     tm_core.set_field(store, S, i32, 'csv_fields', {'species': 'Boar', 'Remarks': 'tail', 'DateTimeIsOk': 'TRUE'})

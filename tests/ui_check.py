@@ -43,12 +43,34 @@ def extend(tree, stations=40, per=30):
         f.write('\r\n'.join(lines) + '\r\n')
 
 
+def add_split_season(tree):
+    """HDD では N250102_P01 と N250102_P02 に分かれ、NAS では N250102 にまとまっている Season を足す。"""
+    H = lambda d, st, name: os.path.join(tree['hdd'], d, st, name)        # noqa: E731
+    N = lambda st, name: os.path.join(tree['nas'], 'N250102', st, name)   # noqa: E731
+    a = open(tree['avi'], 'rb').read()                                    # 再生できる AVI
+    other = os.path.join(os.path.dirname(tree['avi']), '_short.avi')
+    fixture.synth_avi(other, [fixture.strip_dht(f) for f in tree['frames'][:10]])
+    b = open(other, 'rb').read()
+    fixture.put(H('N250102_P01', 'BSN0001', 'IMG_0001.AVI'), a)
+    fixture.put(H('N250102_P01', 'BSN0001', 'IMG_0002.AVI'), a)
+    fixture.put(H('N250102_P02', 'BSN0001', 'IMG_0001.AVI'), b)           # 同じ Station の同じ名前（中身が違う）
+    fixture.put(H('N250102_P02', 'BSN0003', 'IMG_0001.AVI'), a)
+    fixture.put(H('N250102_P02', 'BSN0004', 'IMG_0001.AVI'), a)           # HDD にしかない
+    for st, name in (('BSN0001', 'IMG_0001.AVI'), ('BSN0001', 'IMG_0002.AVI'), ('BSN0003', 'IMG_0001.AVI')):
+        fixture.put(N(st, name), a)
+    lines = ['N250102,%s,%s,2025/01/05 06:07:08,deer,' % x for x in
+             (('BSN0001', 'IMG_0001.AVI'), ('BSN0001', 'IMG_0002.AVI'), ('BSN0003', 'IMG_0001.AVI'))]
+    with open(tree['csv'], 'a', encoding='utf-8', newline='') as f:
+        f.write('\r\n'.join(lines) + '\r\n')
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(tempfile.gettempdir(), 'tm_ui')
     os.makedirs(out, exist_ok=True)
     base = tempfile.mkdtemp(prefix='tm_ui_')
     tree = fixture.build(os.path.join(base, 'tree'))
     extend(tree)
+    add_split_season(tree)
     port = free_port()
     env = dict(os.environ, TRAPMATCH_NO_OPEN='1', PYTHONIOENCODING='utf-8')
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, 'app.py'), '--port', str(port),
@@ -70,6 +92,7 @@ def main():
             logs = []
             page.on('console', lambda m: logs.append('%s: %s' % (m.type, m.text)) if m.type in ('error', 'warning') else None)
             page.on('pageerror', lambda e: logs.append('pageerror: %s' % e))
+            page.on('response', lambda r: logs.append('http %d: %s %s' % (r.status, r.request.method, r.url)) if r.status >= 400 else None)
 
             def check(cond, label):
                 print(('ok   ' if cond else 'FAIL ') + label)
@@ -459,6 +482,49 @@ def main():
                   '古い版が動いたままだと、起動し直しの案内が出る')
             page.screenshot(path=os.path.join(out, '14_old_version.png'))
             page.unroute('**/api/state')
+
+            # 13. Season 名は、先頭の英字 1 文字と数字 6 桁だけで照合する
+            page.reload()
+            page.wait_for_selector('.row', timeout=10000)
+            page.fill('#season', 'Ｎ250102_P02')
+            page.press('#season', 'Enter')
+            page.wait_for_function("document.getElementById('season').value === 'N250102'")
+            page.wait_for_function("!document.getElementById('empty').hidden")
+            check('「N250102」はまだ走査していません' in page.inner_text('#empty'), '後ろに文字を付けて入力しても、N250102 として扱う')
+            opts = page.evaluate("[...document.querySelectorAll('#seasonList option')].map(o => o.value)")
+            check('N250102' in opts and not [o for o in opts if o.startswith('N250102_')],
+                  'Season の候補は、まとめた名前で出る（%s）' % [o for o in opts if o.startswith('N2501')])
+            page.click('#btnScan')
+            page.wait_for_function("TM.S.data && TM.S.data.season === 'N250102'", timeout=20000)
+            page.wait_for_selector('.row')
+            page.wait_for_timeout(400)
+            note = page.inner_text('#notice')
+            check('2 個のフォルダ（N250102_P01、N250102_P02）を N250102 としてまとめています' in note
+                  and '1 個の Station が複数のフォルダにあり' in note, 'まとめたフォルダの名前を知らせる（%s）' % note.replace('\n', ' / '))
+            check('NAS' not in note, 'フォルダ名が Season 名と同じ保存場所は、知らせに出さない')
+            check('Season フォルダ: N250102_P01、N250102_P02' in page.get_attribute('#thead .src', 'title'), '見出しの補足にフォルダ名が出る')
+            got = page.evaluate("TM.S.rows.map(r => TM.S.data.stations[r.st] + '/' + r.stem + ':' + r.flags)")
+            check(got == ['BSN0001/IMG_0001:12', 'BSN0001/IMG_0002:0', 'BSN0003/IMG_0001:0', 'BSN0004/IMG_0001:1'],
+                  '2 つのフォルダの動画が 1 つの Season として照合される（%s）' % got)
+            page.wait_for_selector('#detail input[name="pick"]')
+            dtext = page.inner_text('#detail')
+            check('フォルダ N250102_P01' in dtext and 'フォルダ N250102_P02' in dtext, '同じ名前のファイルが、どのフォルダのものか分かる')
+            picks = page.evaluate("[...document.querySelectorAll('#detail input[name=pick]')].map(e => e.value)")
+            check(picks == ['hdd:N250102_P01/BSN0001/IMG_0001.AVI', 'hdd:N250102_P02/BSN0001/IMG_0001.AVI', 'nas:IMG_0001.AVI']
+                  or len(set(picks)) == 3, '「これを正とする」は、同じ名前のファイルを区別する（%s）' % picks)
+            page.check('#detail input[name="pick"] >> nth=1')
+            page.wait_for_timeout(600)
+            i1 = page.evaluate('TM.S.detail.id')
+            st, d = c.get('/api/item?season=N250102&id=%d' % i1)
+            check(d['pick'] == picks[1] and [f['folder'] for f in d['sources'][0]['files']] == ['N250102_P01', 'N250102_P02'],
+                  '選んだファイルが保存される（%s）' % d['pick'])
+            page.screenshot(path=os.path.join(out, '15_season_prefix.png'))
+            page.click('#btnSettings')
+            page.wait_for_selector('#setPrefix')
+            check(page.is_checked('#setPrefix'), '設定の窓に、Season 名を先頭だけで照合する項目がある')
+            page.screenshot(path=os.path.join(out, '16_settings_prefix.png'), full_page=True)
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(200)
             for ln in logs:
                 print('console', ln)
             check(not [ln for ln in logs if 'pageerror' in ln or ln.startswith('error')], 'ブラウザのエラーがない')

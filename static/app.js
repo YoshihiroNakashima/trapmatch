@@ -21,7 +21,7 @@
   const DEC_API = { '': '', k: 'keep', d: 'delete', e: 'except' };
   const DEC_CODE = { '': '', keep: 'k', delete: 'd', except: 'e' };
   const ROW_H = 28;
-  const UI_VERSION = '0.2.0';      // この画面のプログラムの版（tm_core.py の VERSION と同じにする）
+  const UI_VERSION = '0.3.0';      // この画面のプログラムの版（tm_core.py の VERSION と同じにする）
 
   const S = {
     cfg: null, ffmpeg: false, dataDir: '', season: '', data: null, busy: false,
@@ -194,6 +194,7 @@
   }
 
   function fillSeasons(seasons, projects) {
+    S.projects = (projects || []).map((p) => p.season);      // 走査済みの Season の名前
     const done = new Map((projects || []).map((p) => [p.season.toLowerCase(), p]));
     const names = seasons.slice();
     for (const p of projects || []) if (!names.some((n) => n.toLowerCase() === p.season.toLowerCase())) names.push(p.season);
@@ -291,21 +292,39 @@
     const lines = [];
     if (!d) { $('notice').hidden = true; return; }
     const info = d.info || {};
+    const cur = S.cfg;
+    // 走査したときに Season 名を先頭だけで照合していなければ、後ろに文字が付いたフォルダは探していない
+    const retry = d.season_prefix !== true && cur.settings.season_prefix && seasonKey(d.season, true) === d.season
+      ? `「走査」をやり直すと、${d.season}_P01 のように後ろに文字が付いたフォルダも探します。` : '';
     for (const sid of info.missing_season || []) {
       const s = d.sources.find((x) => x.id === sid);
-      if (s) lines.push(`「${s.name}」に Season フォルダ「${d.season}」がありません。この保存場所の動画はすべて「なし」として扱っています。`);
+      if (s) lines.push(`「${s.name}」に Season フォルダ「${d.season}」がありません。この保存場所の動画はすべて「なし」として扱っています。${retry}`);
+    }
+    // 複数のフォルダを 1 つの Season にまとめたとき、名前が Season 名と違うフォルダを使ったとき
+    for (const s of d.sources) {
+      const dirs = s.dirs || [];
+      if (s.type !== 'folder' || !dirs.length || (dirs.length === 1 && dirs[0] === d.season)) continue;
+      const names = dirs.length > 4 ? dirs.slice(0, 3).join('、') + ` ほか ${nf(dirs.length - 3)} 個` : dirs.join('、');
+      const multi = (info.station_multi || {})[s.id] || 0;
+      lines.push(dirs.length > 1
+        ? `「${s.name}」では、${nf(dirs.length)} 個のフォルダ（${names}）を ${d.season} としてまとめています。` +
+          (multi ? `${nf(multi)} 個の Station が複数のフォルダにあり、同じ Station の同じファイル名は同じ動画として扱っています（「場所内の重複」になります）。` : '')
+        : `「${s.name}」では、フォルダ「${names}」を ${d.season} として扱っています。`);
+    }
+    if ((d.inherited_from || []).length) {
+      lines.push(`以前に ${d.inherited_from.join('、')} の名前で走査したときの判断とメモを引き継ぎました（元の作業状態はそのまま残っています）。`);
     }
     if (d.csv && d.csv.malformed) lines.push(`CSV に、引用符（"）の対応が取れない行が ${nf(d.csv.malformed)} か所あります。その付近の行は正しく読めていない可能性があります。`);
     const ex = (info.exceptions || []).length;
     if (ex) lines.push(`想定の階層にない動画が ${nf(ex)} か所あります（「集計」で確認できます。照合の対象にはしていません）。`);
-    const cur = S.cfg;
     const used = cur.sources.filter((s) => s.enabled && s.path);
     const folders = used.filter((s) => s.type === 'folder');
     const csvs = used.filter((s) => s.type === 'csv').slice(0, 1);
     const now = folders.concat(csvs).map((s) => s.id + '|' + (s.type === 'csv' ? s.path.replace(/\{season\}/gi, d.season) : s.path)).join('\n');
     const then = d.sources.map((s) => s.id + '|' + s.path).join('\n');
     const extsNow = cur.settings.exts.slice().sort().join(',');
-    if (now !== then || cur.settings.ignore_ext !== d.ignore_ext || extsNow !== d.exts.slice().sort().join(',')) {
+    const prefixChanged = typeof d.season_prefix === 'boolean' && d.season_prefix !== !!cur.settings.season_prefix;
+    if (now !== then || cur.settings.ignore_ext !== d.ignore_ext || extsNow !== d.exts.slice().sort().join(',') || prefixChanged) {
       lines.push('保存場所か照合の設定が、走査のあとに変わっています。「走査」をやり直すと反映されます（判断とメモは保たれます）。');
     }
     $('notice').innerHTML = lines.map((l) => `<div>${esc(l)}</div>`).join('');
@@ -320,7 +339,10 @@
     document.documentElement.style.setProperty('--cols', cols);
     document.documentElement.style.setProperty('--minw', minw + 'px');
     let h = '<div class="hrow"><div>Station</div><div>ファイル名</div>';
-    for (const s of d.sources) h += `<div class="src" title="${esc(s.path)}">${esc(s.name)}</div>`;
+    for (const s of d.sources) {
+      const dirs = s.type === 'folder' && s.dirs && s.dirs.length ? '\nSeason フォルダ: ' + s.dirs.join('、') : '';
+      h += `<div class="src" title="${esc(s.path + dirs)}">${esc(s.name)}</div>`;
+    }
     h += '<div>状態</div><div>判断</div><div>メモ</div></div>';
     $('thead').innerHTML = h;
   }
@@ -819,10 +841,13 @@
           h += `<div class="dfile none"><div class="l1"><span class="sn">${esc(s.name)}</span><span>なし</span></div></div>`;
           continue;
         }
+        // Season フォルダの名前は、Season 名と違うか、この動画のファイルが複数あるときに見せる
+        const showDir = s.files.length > 1 || s.files.some((f) => f.folder && f.folder !== data.season);
         for (const f of s.files) {
-          const pv = s.id + ':' + f.name;
+          const pv = f.pick || (s.id + ':' + f.name);
           h += `<div class="dfile"><div class="l1"><span class="sn">${esc(s.name)}</span><span class="fnm">${esc(f.name)}</span></div>` +
             `<div class="l2"><span>${fmtSize(f.size)}（${nf(f.size)} バイト）</span><span>更新 ${fmtTime(f.mtime)}</span></div>` +
+            (showDir && f.folder ? `<div class="l2"><span>フォルダ ${esc(f.folder)}${f.station_dir && f.station_dir !== d.station ? ' / ' + esc(f.station_dir) : ''}</span></div>` : '') +
             `<div class="l2"><button data-play="${esc(s.id)}" data-n="${f.n}">再生</button>` +
             `<button data-open="file" data-src="${esc(s.id)}" data-n="${f.n}">既定のプレーヤーで開く</button>` +
             `<button data-open="folder" data-src="${esc(s.id)}" data-n="${f.n}">フォルダを開く</button>` +
@@ -871,7 +896,7 @@
       h += '<div class="dsec"><h4>CSV に足す行</h4>' +
         `<p class="hint">「残す」と判断すると、Season、Station、File（${esc(d.ref.name)}）を埋めた行が更新後の CSV に入ります。</p>`;
       if (data.csv.has_dt && d.fill) h += fillHint(d);
-      const defs = data.csv.defaults || {};
+      const defs = d.defaults || data.csv.defaults || {};
       if (Object.keys(defs).length) {
         h += '<p class="hint">ほかの列は、空欄のままにすると薄い字の既定値が入ります（既定値は「保存場所と設定」で変えられます）。</p>';
       }
@@ -1205,14 +1230,24 @@
     }
     if (j.kind === 'scan') { refreshSeasons(); loadSeason((j.result && j.result.season) || j.season); }
   }
-  // 入力された Season 名（全角の英数字は半角にそろえる）
+  // Season を見分ける名前。先頭の英字 1 文字と数字 6 桁だけを使う設定なら、その後ろを落とす（N250102_P01 -> N250102）
+  function seasonKey(name, byPrefix) {
+    const v = String(name || '').normalize('NFKC').trim();
+    const m = byPrefix ? /^[A-Za-z]\d{6}/.exec(v) : null;
+    return m ? m[0] : v;
+  }
+  // 入力された Season 名（全角の英数字は半角にそろえる）。
+  // 以前にフォルダ名のまま走査した Season（N250102_P01 など）は、その名前のまま開けるようにする。
   function seasonText() {
-    const v = $('season').value.normalize('NFKC').trim();
+    let v = $('season').value.normalize('NFKC').trim();
+    const known = (S.projects || []).some((p) => p.toLowerCase() === v.toLowerCase());
+    if (!known) v = seasonKey(v, !!(S.cfg && S.cfg.settings.season_prefix));
     if (v !== $('season').value) $('season').value = v;
     return v;
   }
   async function startScan() {
-    const season = seasonText();
+    // 走査は、いまの設定の Season 名で行う（フォルダ名のまま走査した古い Season も、まとめた名前に移る）
+    const season = seasonKey(seasonText(), !!(S.cfg && S.cfg.settings.season_prefix));
     if (!season) { toast('Season を選ぶか入力してください', true); $('season').focus(); return; }
     if (!S.cfg.sources.length) { openSettings(); return; }
     await flushSaves();      // 入力中のメモなどを先に保存する
@@ -1279,6 +1314,7 @@
         '<div class="setrow"><button data-act="addfolder">フォルダを追加</button><button data-act="addcsv">CSV を追加</button></div>' +
         '<h3>照合</h3>' +
         `<label class="setrow"><input type="checkbox" id="setIgnore"${st.ignore_ext ? ' checked' : ''}>拡張子を無視して照合する（AVI と MP4 を同じ動画とみなす）</label>` +
+        `<label class="setrow"><input type="checkbox" id="setPrefix"${st.season_prefix ? ' checked' : ''}>Season 名は、先頭の英字 1 文字と数字 6 桁だけで照合する（N250102_P01 と N250102_P02 を、どちらも N250102 として扱う）</label>` +
         `<label class="setrow">対象とする拡張子<input type="text" id="setExts" value="${esc(st.exts.join(', '))}" style="width:200px"></label>` +
         '<h3>CSV</h3>' +
         `<label class="setrow">拡張子をそろえる基準にする保存場所<select id="setExtRef"><option value="auto">自動（上にある保存場所を優先）</option>${folderOpts}</select></label>` +
@@ -1287,7 +1323,7 @@
         '<p class="hint">書く列は、左から順に CSV の見出しと照らし、最初に見つかった列を使います。空欄と NA は印に置き換え、ほかの文字が入っている行では後ろに足します。印を空にすると、付けません。</p>' +
         '<label class="setcol">CSV に足す行の既定値（1 行に 1 列、「列名=値」の形。ここにない列は空欄になります）' +
         `<textarea id="setAddDefs" rows="6" spellcheck="false">${esc(st.add_defaults_text)}</textarea></label>` +
-        '<p class="hint">値に {Season} と書くと Season 名に置き換わります。Season、Station、File、DateTime は自動で入るため、ここでは指定しません。CSV にない列名は無視されます。</p>' +
+        '<p class="hint">値に {Season} と書くと Season 名に、{Folder} と書くとその動画の Season フォルダの名前（CSV で同じ Station の行が使っている値。行がなければ動画が入っているフォルダの名前）に置き換わります。Season、Station、File、DateTime は自動で入るため、ここでは指定しません。CSV にない列名は無視されます。</p>' +
         '<h3>再生と操作</h3>' +
         `<label class="setrow"><input type="checkbox" id="setAutoplay"${st.autoplay ? ' checked' : ''}>動画を選んだら自動で再生する</label>` +
         `<label class="setrow"><input type="checkbox" id="setAutoNext"${st.auto_next ? ' checked' : ''}>判断を付けたら次の未判断の動画へ進む</label>` +
@@ -1303,6 +1339,7 @@
       const g = (id) => document.getElementById(id);
       if (!g('setIgnore')) return;
       st.ignore_ext = g('setIgnore').checked;
+      st.season_prefix = g('setPrefix').checked;
       st.exts = g('setExts').value.split(/[\s,;、]+/).filter(Boolean);
       st.ext_ref = g('setExtRef').value;
       st.embedded_tz = g('setTz').value;

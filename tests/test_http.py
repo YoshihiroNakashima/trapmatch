@@ -122,6 +122,21 @@ def test_scan_and_items(server):
     assert st == 404 and 'error' in e
 
 
+def test_scan_with_suffix_is_the_same_season(server):
+    """Season 名の後ろに文字を付けて走査しても、先頭の英字と数字 6 桁が同じなら同じ Season になる。"""
+    c, tree = server
+    st, r = c.post('/api/scan', {'season': fixture.SEASON + '_P01'})
+    assert st == 200 and r['job']['season'] == fixture.SEASON
+    job = c.wait_job()
+    assert job['state'] == 'done' and job['result'] == {'season': fixture.SEASON, 'items': 19}
+    st, s = c.get('/api/seasons')
+    assert [x['season'] for x in s['projects']] == [fixture.SEASON]
+    st, p = c.get('/api/items?season=' + fixture.SEASON)
+    assert p['season_prefix'] is True and [x['dirs'] for x in p['sources']] == [[fixture.SEASON], [fixture.SEASON], []]
+    st, cfg = c.get('/api/state')
+    assert cfg['config']['settings']['season_prefix'] is True
+
+
 def test_media_range(server):
     c, tree = server
     items, p = ids(c)
@@ -281,7 +296,7 @@ def test_no_changes_while_scanning(server, monkeypatch):
     saved = json.loads(json.dumps(conf))
     conf['sources'][2]['path'] = extra
     c.post('/api/config', conf)
-    st, r = c.post('/api/scan', {'season': fixture.SEASON})
+    st, r = c.post('/api/scan', {'season': fixture.SEASON + '_P02'})      # 後ろに文字が付いていても同じ Season
     assert st == 200
     st, r = c.post('/api/decide', {'season': fixture.SEASON, 'ids': [i], 'decision': 'keep'})
     st2, r2 = c.post('/api/field', {'season': fixture.SEASON.lower(), 'id': i, 'field': 'memo', 'value': 'x'})

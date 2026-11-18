@@ -481,6 +481,10 @@ def p_config(h, q):
 def p_scan(h, q):
     body = h.read_json()
     season = (body.get('season') or '').strip()
+    # 走査する Season の名前（N250102_P01 と入力されても、設定によっては N250102 として走査する）。
+    # 走査中にその Season の判断を変えられないようにするため、ここで決めておく。
+    by_prefix = bool(APP.store.config()['settings'].get('season_prefix', True))
+    season = tm_core.season_key(season, by_prefix)
     if not season:
         raise HttpError(400, 'Season を指定してください')
     job = APP.jobs.start('scan', season, lambda job: tm_core.run_scan(APP.store, season, job))

@@ -118,9 +118,10 @@ def main():
         ], 'settings': {'exts': ['avi', 'mp4', 'mov', 'webm']}})
         check(st == 200 and os.path.isfile(os.path.join(data, 'config.json')), '保存場所を登録できる')
         S = fixture.SEASON
-        st, r = post_json(port, '/api/scan', {'season': S})
+        st, r = post_json(port, '/api/scan', {'season': S + '_P01'})      # 後ろに付いた文字は無視して、同じ Season として走査する
         job = wait_job(port)
-        check(st == 200 and job['state'] == 'done', '走査できる（%s）' % (job.get('error') or job['state']))
+        check(st == 200 and job['state'] == 'done' and (job.get('result') or {}).get('season') == S,
+              '走査できる（%s）' % (job.get('error') or job['state']))
         st, p = get_json(port, '/api/items?season=' + S)
         items = {(p['stations'][a[1]], a[2]): a for a in p['items']}
         n_mis = sum(1 for a in p['items'] if a[4] & tm_core.F_NEEDS)

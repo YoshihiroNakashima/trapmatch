@@ -175,20 +175,27 @@ def _columns(header):
     return cols
 
 
-def read_season(path, season, progress=None):
-    """CSV から対象の Season の行だけを読む。"""
+def read_season(path, season, progress=None, match=None):
+    """CSV から対象の Season の行だけを読む。
+
+    match を渡すと、Season 列の値がその Season のものかどうかを match(値) で決める
+    （Season 名を先頭の文字だけで照合するときなど）。season は、その行に必ず含まれる文字列にする。
+    渡さなければ、Season 列の値が season と同じ（大文字と小文字は区別しない）行を読む。
+    """
     last = None
     for enc in candidate_encodings(path):
         try:
-            return _read_season(path, season, enc, progress)
+            return _read_season(path, season, enc, progress, match)
         except UnicodeDecodeError as e:
             last = e
     raise ValueError('CSV の文字コードを判定できません（UTF-8 と Shift_JIS を試しました）: %s' % last)
 
 
-def _read_season(path, season, enc, progress):
+def _read_season(path, season, enc, progress, match=None):
     size = os.path.getsize(path)
     season_cf = season.strip().casefold()
+    if match is None:
+        match = lambda value: value.casefold() == season_cf    # noqa: E731
     stats = {}
     with open(path, 'rb') as fb:
         f = io.TextIOWrapper(fb, encoding=enc, newline='')
@@ -221,7 +228,7 @@ def _read_season(path, season, enc, progress):
             fields = parse_record(raw, delim)
             if len(fields) <= need:
                 continue
-            if fields[i_season].strip().casefold() != season_cf:
+            if not match(fields[i_season].strip()):
                 continue
             rows.append(fields)
     return {
@@ -254,16 +261,19 @@ def add_mark(old, text):
 
 
 def write_updated(src, dst, meta, season, keyfunc, remove_keys, ext_new, add_rows,
-                  removed_path=None, progress=None, marks=None):
+                  removed_path=None, progress=None, marks=None, match=None):
     """src を読みながら、変更を反映した CSV を dst に書く。
 
     remove_keys: 行を除く照合キーの集合
     ext_new:     照合キー -> 新しい拡張子（File 列の拡張子を書き換える）
     add_rows:    末尾に足す行（列の値のリスト）のリスト
     marks:       (列番号, 印の文字列, 照合キーの集合)。その行の列に印を付ける。None なら付けない
+    match:       Season 列の値がこの Season のものかを決める関数（read_season と同じ）
     変更のないレコードは元のテキストのまま書く。戻り値は件数の辞書。
     """
     season_cf = season.strip().casefold()
+    if match is None:
+        match = lambda value: value.casefold() == season_cf    # noqa: E731
     size = os.path.getsize(src)
     # いったん別の名前（.part）に書き、最後まで書けたときだけ本来の名前にする。
     # 途中で失敗しても、不完全な CSV が「更新後の CSV」として残らないようにするため。
@@ -273,7 +283,7 @@ def write_updated(src, dst, meta, season, keyfunc, remove_keys, ext_new, add_row
         removed_path = removed_path + '.part'
     try:
         res = _write_updated(src, dst, meta, season_cf, keyfunc, remove_keys, ext_new, add_rows,
-                             removed_path, progress, size, marks)
+                             removed_path, progress, size, marks, match)
     except BaseException:
         for p in (dst, removed_path):
             try:
@@ -289,7 +299,7 @@ def write_updated(src, dst, meta, season, keyfunc, remove_keys, ext_new, add_row
 
 
 def _write_updated(src, dst, meta, season_cf, keyfunc, remove_keys, ext_new, add_rows,
-                   removed_path, progress, size, marks=None):
+                   removed_path, progress, size, marks=None, match=None):
     enc, delim, eol = meta['encoding'], meta['delimiter'], meta['eol']
     i_season, i_station, i_file = meta['i_season'], meta['i_station'], meta['i_file']
     need = max(i_season, i_station, i_file)
@@ -315,7 +325,7 @@ def _write_updated(src, dst, meta, season_cf, keyfunc, remove_keys, ext_new, add
                     progress(fb.tell(), size)
                 if season_cf in raw.casefold():
                     fields = parse_record(raw, delim)
-                    if len(fields) > need and fields[i_season].strip().casefold() == season_cf:
+                    if len(fields) > need and match(fields[i_season].strip()):
                         key, _stem, ext = keyfunc(fields[i_station], fields[i_file])
                         if key is not None and key in remove_keys:
                             n_removed += 1

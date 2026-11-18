@@ -16,7 +16,7 @@ from datetime import datetime
 import tm_csv
 import tm_media
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 
 # 状態のビット
 F_MISSING = 1    # 欠け（一部の保存場所にしかない）
@@ -38,9 +38,10 @@ DECISIONS = ('', 'keep', 'delete', 'except')
 # CSV に足す行の、列ごとの既定値。列名は大文字と小文字を区別せずに CSV の見出しと照らし、
 # CSV にない列は無視する。Season、Station、File、DateTime はここでは扱わない（別に決まる）。
 # ここにない列は空欄になる。設定（add_defaults）で変えられる。
-# 値の中の {Season} は、その Season 名に置き換わる。
+# 値の中の {Season} は Season 名に、{Folder} はその動画（Station）の Season フォルダの名前に置き換わる。
+# Season フォルダの名前は、N250102_P01 のように Season 名の後ろに文字が付いていることがある。
 ADD_ROW_DEFAULTS = {
-    'Season_sub_folder': '{Season}',
+    'Season_sub_folder': '{Folder}',
     'DeleteFlag': 'FALSE', 'Pass': 'TRUE', 'Star': 'FALSE', 'Remarks': 'NA', 'PassCount': '0',
     'Indep': 'TRUE', 'LeftCens': 'FALSE', 'RightCens': 'FALSE',
     'StartTime': '999.9', 'EndTime': '999.9', 'Species': 'Add',
@@ -62,6 +63,9 @@ DEFAULT_SETTINGS = {
     # mark_cols の列名を順に CSV の見出しと照らし、最初に見つかった列に書く。mark_text が空なら付けない。
     'mark_text': 'csvのみ',
     'mark_cols': ['Note', 'Remarks'],
+    # Season 名を、先頭の英字 1 文字と数字 6 桁（N250102 など）だけで照合する。
+    # N250102_P01 と N250102_P02 のようなフォルダは、どちらも N250102 としてまとめて扱う。
+    'season_prefix': True,
     'ext_ref': 'auto',       # CSV の拡張子をそろえる基準の保存場所（'auto' は優先順）
     'ffmpeg': '',
 }
@@ -253,8 +257,11 @@ class Store(object):
         if st.get('dt_source') in DT_SOURCES:
             o['dt_source'] = st['dt_source']
         # 設定に項目がなければ（以前の版の設定など）組み込みの既定値を使う。空の指定は「既定値なし」。
-        o['add_defaults'] = clean_add_defaults(st['add_defaults']) if 'add_defaults' in st \
-            else dict(ADD_ROW_DEFAULTS)
+        # season_prefix の項目がない設定は、0.2.0 以前に保存されたもの
+        o['add_defaults'] = clean_add_defaults(st['add_defaults'], migrate='season_prefix' not in st) \
+            if 'add_defaults' in st else dict(ADD_ROW_DEFAULTS)
+        if isinstance(st.get('season_prefix'), bool):
+            o['season_prefix'] = st['season_prefix']
         if isinstance(st.get('mark_text'), str):
             t = st['mark_text'].strip()
             if len(t) <= 100 and not any(c in t for c in '\r\n\x00'):
@@ -424,7 +431,11 @@ class JobRunner(object):
 # ---------------------------------------------------------------- 走査
 
 def list_seasons(cfg):
-    """フォルダ型の保存場所の直下にあるフォルダ名（Season の候補）。"""
+    """フォルダ型の保存場所の直下にあるフォルダ名（Season の候補）。
+
+    Season 名を先頭だけで照合する設定のときは、N250102_P01 と N250102_P02 を N250102 の 1 つにまとめる。
+    """
+    by_prefix = bool(cfg['settings'].get('season_prefix', True))
     names = {}
     errors = []
     for s in cfg['sources']:
@@ -435,7 +446,8 @@ def list_seasons(cfg):
                 for e in it:
                     try:
                         if e.is_dir() and not skip_dir(e.name):
-                            names.setdefault(e.name.casefold(), e.name)
+                            key = season_key(e.name, by_prefix)
+                            names.setdefault(key.casefold(), key)
                     except OSError:
                         continue
         except OSError as err:
@@ -491,21 +503,47 @@ def norm_season(season):
     return unicodedata.normalize('NFKC', season or '').strip()
 
 
-def canonical_season(folders, season):
-    """Season 名を、フォルダの実際の綴り（大文字小文字、全角と半角）にそろえる。"""
-    cf = norm_season(season).casefold()
-    for s in folders:
-        try:
-            with os.scandir(s['path']) as it:
-                for e in it:
-                    try:
-                        if norm_season(e.name).casefold() == cf and e.is_dir():
-                            return e.name
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-    return season
+_SEASON_PREFIX = re.compile(r'[A-Za-z]\d{6}')
+
+
+def season_key(name, by_prefix=True):
+    """Season を見分ける名前。
+
+    by_prefix のときは、先頭の英字 1 文字と数字 6 桁（N250102 など）だけを使い、その後ろは無視する。
+    N250102_P01 も N250102_P02 も N250102 になる。この形で始まらない名前は、全体をそのまま使う。
+    """
+    s = norm_season(name)
+    if by_prefix:
+        m = _SEASON_PREFIX.match(s)
+        if m:
+            return m.group(0)
+    return s
+
+
+def season_dirs(src, season, by_prefix=True):
+    """保存場所の直下にある、その Season のフォルダの名前（自然な順）。
+
+    Season 名の後ろに文字が付いたフォルダ（N250102_P01 など）が複数あれば、すべて返す。
+    """
+    cf = season_key(season, by_prefix).casefold()
+    out = []
+    with os.scandir(src['path']) as it:
+        for e in it:
+            try:
+                if e.is_dir() and not skip_dir(e.name) and season_key(e.name, by_prefix).casefold() == cf:
+                    out.append(e.name)
+            except OSError:
+                continue
+    out.sort(key=natural_key)
+    return out
+
+
+def season_dir_of(f, season):
+    """ファイルの情報から、そのファイルが入っている Season フォルダの名前を返す。
+
+    0.2.0 以前の走査結果には記録がないので、そのときは Season 名（当時はフォルダ名と同じ）。
+    """
+    return f[4] if len(f) > 4 and f[4] else season
 
 
 def compute_flags(files, cj, nfold, mask, full_mask):
@@ -542,11 +580,17 @@ def csv_exts(cj):
 
 
 def run_scan(store, season, job):
-    season = norm_season(season)
-    if not season:
-        raise ValueError('Season を指定してください')
     cfg = store.config()
     settings = cfg['settings']
+    by_prefix = bool(settings.get('season_prefix', True))
+    season = season_key(season, by_prefix)
+    if not season:
+        raise ValueError('Season を指定してください')
+    season_cf = season.casefold()
+
+    def is_season(value):
+        return season_key(value, by_prefix).casefold() == season_cf
+
     exts = set(settings['exts'])
     ignore_ext = bool(settings['ignore_ext'])
     sources = [s for s in cfg['sources'] if s.get('enabled', True) and s.get('path')]
@@ -562,35 +606,50 @@ def run_scan(store, season, job):
     for s in csvs:
         if not os.path.isfile(s['path']):
             raise ValueError('保存場所「%s」の CSV が見つかりません: %s' % (s['name'], s['path']))
-    season = canonical_season(folders, season)
     bit = {s['id']: i for i, s in enumerate(used)}
     nfold = len(folders)
     full_mask = (1 << len(used)) - 1
-    info = {'missing_season': [], 'nontarget': {}, 'exceptions': [], 'files': {}, 'stations': {}}
+    # season_dirs: 保存場所ごとの、この Season のフォルダ名（N250102_P01 と N250102_P02 のように複数のことがある）
+    # station_dirs: 保存場所ごとの、Station（小文字にそろえた名前）-> [Season フォルダ名, Station フォルダ名]
+    # station_multi: 保存場所ごとの、複数の Season フォルダにある Station の数
+    info = {'missing_season': [], 'nontarget': {}, 'exceptions': [], 'files': {}, 'stations': {},
+            'season_dirs': {}, 'station_dirs': {}, 'station_multi': {}}
     tasks = []
     job.update(phase='フォルダの一覧を取得中', done=0, total=0)
+    spelling = None
     for s in folders:
-        sdir = os.path.join(s['path'], season)
         info['nontarget'][s['id']] = 0
         info['files'][s['id']] = 0
         info['stations'][s['id']] = 0
-        if not os.path.isdir(sdir):
+        info['station_dirs'][s['id']] = {}
+        dirs = season_dirs(s, season, by_prefix)
+        info['season_dirs'][s['id']] = dirs
+        if not dirs:
             info['missing_season'].append(s['id'])
             continue
-        with os.scandir(sdir) as it:
-            for e in it:
-                try:
-                    if e.is_dir():
-                        if not skip_dir(e.name):
-                            tasks.append((s, e.name, e.path))
-                    elif ext_of(e.name).lower() in exts:
-                        info['exceptions'].append(
-                            {'src': s['id'], 'path': e.path, 'kind': 'season', 'count': 1})
-                    else:
-                        info['nontarget'][s['id']] += 1
-                except OSError:
-                    continue
-        info['stations'][s['id']] = sum(1 for t in tasks if t[0] is s)
+        if spelling is None:
+            spelling = season_key(dirs[0], by_prefix)      # フォルダの実際の綴り（大文字小文字、全角と半角）
+        seen_in = {}
+        for dname in dirs:
+            with os.scandir(os.path.join(s['path'], dname)) as it:
+                for e in it:
+                    try:
+                        if e.is_dir():
+                            if not skip_dir(e.name):
+                                tasks.append((s, e.name, e.path, dname))
+                                info['station_dirs'][s['id']].setdefault(e.name.casefold(), [dname, e.name])
+                                seen_in.setdefault(e.name.casefold(), set()).add(dname)
+                        elif ext_of(e.name).lower() in exts:
+                            info['exceptions'].append(
+                                {'src': s['id'], 'path': e.path, 'kind': 'season', 'count': 1})
+                        else:
+                            info['nontarget'][s['id']] += 1
+                    except OSError:
+                        continue
+        info['stations'][s['id']] = len(info['station_dirs'][s['id']])
+        info['station_multi'][s['id']] = sum(1 for v in seen_in.values() if len(v) > 1)
+    if spelling:
+        season = spelling
 
     items = {}
 
@@ -612,7 +671,7 @@ def run_scan(store, season, job):
     if tasks:
         with ThreadPoolExecutor(max_workers=8) as ex:
             for n, (t, res, err) in enumerate(ex.map(work, tasks), 1):
-                s, stname, spath = t
+                s, stname, spath, dname = t
                 if err is not None:
                     info['exceptions'].append(
                         {'src': s['id'], 'path': spath, 'kind': 'error', 'count': 0,
@@ -624,7 +683,7 @@ def run_scan(store, season, job):
                     for name, size, mtime in videos:
                         key, stem, _ext = make_key(stname, name, ignore_ext, exts)
                         it = get_item(key, stname, stem)
-                        it['files'].setdefault(s['id'], []).append([name, size, mtime, stname])
+                        it['files'].setdefault(s['id'], []).append([name, size, mtime, stname, dname])
                         it['mask'] |= 1 << bit[s['id']]
                     for sd in subdirs:
                         c = count_videos_below(sd, exts)
@@ -643,7 +702,7 @@ def run_scan(store, season, job):
             job.update(done=int(100.0 * pos / max(1, size)))
 
         st = os.stat(s['path'])
-        data = tm_csv.read_season(s['path'], season, prog)
+        data = tm_csv.read_season(s['path'], season, prog, match=is_season)
         i_station, i_file, i_dt = data['i_station'], data['i_file'], data['i_dt']
         n_blank = n_nontarget = n_rows = 0
         dt_samples = []
@@ -651,8 +710,16 @@ def run_scan(store, season, job):
         b = bit[s['id']]
         if data['rows'] and info['missing_season'] == [x['id'] for x in folders]:
             # どのフォルダにもこの Season がないときは、CSV に書かれた綴りを使う
-            season = data['rows'][0][data['i_season']].strip() or season
+            season = season_key(data['rows'][0][data['i_season']], by_prefix) or season
+        # Season 列の綴りと、Season フォルダの名前の列（Season_sub_folder）
+        season_names = {}
+        cols_cf = [h.strip().casefold() for h in data['header']]
+        i_sub = cols_cf.index('season_sub_folder') if 'season_sub_folder' in cols_cf else -1
+        station_sub = {}
+        station_season = {}
         for fields in data['rows']:
+            sname = fields[data['i_season']].strip()
+            season_names[sname] = season_names.get(sname, 0) + 1
             station = fields[i_station].strip()
             fname = basename_any(fields[i_file].strip())
             if not station or not fname:
@@ -665,6 +732,15 @@ def run_scan(store, season, job):
             it = get_item(key, station, stem)
             dt = fields[i_dt].strip() if 0 <= i_dt < len(fields) else ''
             station_names.setdefault(station.casefold(), station)
+            # Station ごとの Season 列の綴り（N250102_P01 のように書かれた CSV で、足す行を同じ綴りにするため）
+            if station_season.setdefault(station.casefold(), sname) != sname:
+                station_season[station.casefold()] = ''
+            if 0 <= i_sub < len(fields):
+                # Station ごとの Season フォルダ名。行によって違う Station は、決められないので空にする
+                sub = fields[i_sub].strip()
+                prev = station_sub.setdefault(station.casefold(), sub)
+                if prev != sub:
+                    station_sub[station.casefold()] = ''
             if it['csv'] is None:
                 it['csv'] = {'n': 0, 'file': fname, 'ext': ext, 'dt': dt, 'rows': [], 'extn': {}}
             cj = it['csv']
@@ -686,6 +762,11 @@ def run_scan(store, season, job):
             'i_file': i_file, 'i_dt': i_dt, 'records': data['records'], 'rows': n_rows,
             'blank': n_blank, 'nontarget': n_nontarget, 'dtfmt': detect_dt_format(dt_samples),
             'malformed': data.get('malformed', 0), 'station_names': station_names,
+            # CSV に足す行の Season 列に使う綴り（この Season の行がすべて同じ綴りのときだけ）
+            'season_name': list(season_names)[0] if len(season_names) == 1 else '',
+            'i_sub': i_sub, 'station_sub': {k: v for k, v in station_sub.items() if v},
+            # Season 列の綴りが 1 つでないときに使う、Station ごとの綴り（その Station の行がすべて同じときだけ）
+            'station_season': ({k: v for k, v in station_season.items() if v} if len(season_names) > 1 else {}),
         }
 
     job.update(phase='照合中', done=0, total=len(items))
@@ -700,6 +781,9 @@ def run_scan(store, season, job):
         raise ValueError('「%s」という Season の動画は、どの保存場所にも CSV にも見つかりません。'
                          'Season 名を確かめてください。' % season)
     job.update(phase='作業状態を保存中', done=0, total=len(ordered))
+    inherit, inherited_from = ({}, [])
+    if by_prefix and not store.has_project(season):
+        inherit, inherited_from = earlier_decisions(store, season_cf, by_prefix)
     con = store.connect(season, create=True)
     try:
         old = {}
@@ -732,6 +816,9 @@ def run_scan(store, season, job):
                     g = gone[key]
                     dec, memo, pick, cf, decided = g[1] or '', g[2] or '', g[3] or '', g[4] or '', g[5] or ''
                     con.execute('DELETE FROM gone WHERE key=?', (key,))
+                elif key in inherit:
+                    g = inherit[key]
+                    dec, memo, pick, cf, decided = g[1] or '', g[2] or '', g[3] or '', g[4] or '', g[5] or ''
             rows.append((item_id, key, n, it['station'], it['stem'], it['mask'], it['flags'], files_json,
                          csv_json, dec, memo, pick, cf, dt_emb, dt_kind, dt_src, decided))
         con.executemany(
@@ -746,24 +833,74 @@ def run_scan(store, season, job):
         set_meta(con, season=season, scanned_at=now_text(), version=VERSION, next_id=next_id,
                  sources=[{'id': s['id'], 'name': s['name'], 'type': s['type'], 'path': s['path'],
                            'readonly': s.get('readonly', False)} for s in used],
-                 ignore_ext=ignore_ext, exts=sorted(exts), info=info, csv=csv_meta)
+                 ignore_ext=ignore_ext, exts=sorted(exts), info=info, csv=csv_meta,
+                 season_prefix=by_prefix)
+        set_meta(con, inherited_from=inherited_from)      # 引き継ぎの知らせは、次に走査するまで出す
         con.commit()
     finally:
         con.close()
     return {'season': season, 'items': len(ordered)}
 
 
+def earlier_decisions(store, season_cf, by_prefix):
+    """同じ Season に当たる、別の名前の作業状態（N250102_P01 など）にある判断とメモを集める。
+
+    Season 名を先頭だけで照合するようになる前に、フォルダ名のまま走査した分を、初めての走査のときに引き継ぐ。
+    元の作業状態は消さない。戻り値は ({動画のキー: 行}, [引き継ぎ元の Season 名])。
+    """
+    found = {}
+    names = []
+    for p in store.projects():
+        name = p['season']
+        if name.casefold() == season_cf or season_key(name, by_prefix).casefold() != season_cf:
+            continue
+        try:
+            con = store.connect(name)
+        except (KeyError, OSError, sqlite3.Error):
+            continue
+        try:
+            n = 0
+            for r in con.execute("SELECT key, decision, memo, pick, csv_fields, decided_at FROM items"
+                                 " WHERE decision != '' OR memo != '' OR pick != '' OR csv_fields != ''"):
+                if r[0] not in found:
+                    found[r[0]] = r
+                    n += 1
+            if n:
+                names.append(name)
+        except sqlite3.Error:
+            continue
+        finally:
+            con.close()
+    return found, names
+
+
 # ---------------------------------------------------------------- 読み出し
+
+def pick_id(sid, f, fl):
+    """「これを正とする」で選んだファイルを表す文字列。
+
+    ふつうは「保存場所:ファイル名」。同じ保存場所に同じ名前のファイルが複数あるとき（別の Season フォルダや、
+    綴りの違う Station フォルダにある場合）は、「保存場所:Season フォルダ/Station フォルダ/ファイル名」にする。
+    """
+    if sum(1 for g in fl if g[0] == f[0]) > 1:
+        return '%s:%s/%s/%s' % (sid, season_dir_of(f, ''), f[3], f[0])
+    return '%s:%s' % (sid, f[0])
+
 
 def picked_file(files, used, pick):
     """利用者が「これを正とする」で選んだファイル。(保存場所, ファイルの情報) か None。"""
     if not pick:
         return None
     sid, _, name = pick.partition(':')
+    where = None
+    if '/' in name:
+        parts = name.split('/')
+        if len(parts) == 3:
+            where, name = (parts[0], parts[1]), parts[2]
     for s in used:
         if s['id'] == sid and s['type'] == 'folder':
             for f in files.get(sid) or []:
-                if f[0] == name:
+                if f[0] == name and (where is None or (season_dir_of(f, ''), f[3]) == where):
                     return s, f
     return None
 
@@ -840,8 +977,13 @@ def load_payload(store, season):
     return {
         'season': meta.get('season', season), 'scanned_at': meta.get('scanned_at', ''),
         'sources': [{'id': s['id'], 'name': s['name'], 'type': s['type'], 'path': s['path'],
-                     'readonly': s.get('readonly', False)} for s in used],
+                     'readonly': s.get('readonly', False),
+                     # この Season のフォルダ名（N250102_P01 と N250102_P02 のように複数のことがある）
+                     'dirs': (meta.get('info', {}).get('season_dirs') or {}).get(s['id'], [])} for s in used],
         'ignore_ext': meta.get('ignore_ext', True), 'exts': meta.get('exts', []),
+        # 走査したときに Season 名を先頭だけで照合したか（0.2.0 以前の走査結果は None）
+        'season_prefix': meta.get('season_prefix'),
+        'inherited_from': meta.get('inherited_from', []),
         'info': meta.get('info', {}),
         'csv': ({'path': csv_meta['path'], 'header': csv_meta['header'], 'rows': csv_meta['rows'],
                  'records': csv_meta['records'], 'blank': csv_meta['blank'],
@@ -849,7 +991,7 @@ def load_payload(store, season):
                  'malformed': csv_meta.get('malformed', 0),
                  'has_dt': csv_meta['i_dt'] >= 0,
                  'fixed_cols': [csv_meta['i_season'], csv_meta['i_station'], csv_meta['i_file']],
-                 # CSV に足す行の既定値（列番号 -> 値）
+                 # CSV に足す行の既定値（列番号 -> 値）。動画ごとに違う値は、動画の詳細のほうで返す
                  'defaults': {str(i): v for i, v in add_row_defaults(csv_meta, cfg['settings'], meta['season']).items()},
                  # CSV にしかない動画を「残す」とした行に付ける印
                  'mark': mark_info(csv_meta, cfg['settings'])}
@@ -874,7 +1016,7 @@ def _row_dict(con, item_id):
 
 
 def file_path(src, season, f):
-    return os.path.join(src['path'], season, f[3], f[0])
+    return os.path.join(src['path'], season_dir_of(f, season), f[3], f[0])
 
 
 def resolve_file(store, season, item_id, src_id, n=0):
@@ -1022,8 +1164,12 @@ def dt_profile(con, meta):
     return prof
 
 
-def clean_add_defaults(raw):
-    """設定の add_defaults を {列名: 値} に整える。値が空の列は「既定値なし」なので落とす。"""
+def clean_add_defaults(raw, migrate=False):
+    """設定の add_defaults を {列名: 値} に整える。値が空の列は「既定値なし」なので落とす。
+
+    migrate は、0.2.0 以前に保存された設定を読むとき。そのころの組み込みの既定値だった
+    Season_sub_folder={Season} を、{Folder} に読み替える。
+    """
     out = {}
     if not isinstance(raw, dict):
         return dict(ADD_ROW_DEFAULTS)
@@ -1038,17 +1184,41 @@ def clean_add_defaults(raw):
             continue
         if any(name.casefold() == x.casefold() for x in out):
             continue
+        if migrate and name.casefold() == 'season_sub_folder' and val.casefold() == '{season}':
+            # フォルダ名が Season 名と同じなら結果は変わらず、N250102_P01 のようなフォルダのときは、その名前が入る
+            val = '{Folder}'
         out[name] = val
         if len(out) >= MAX_ADD_DEFAULTS:
             break
     return out
 
 
-def add_row_defaults(csv_meta, settings, season):
+FOLDER_LABEL = '（Season フォルダの名前）'      # 動画ごとに違う値を、一覧などで示すときの文
+
+
+def season_folder_for(it, used, csv_meta, season, ext_ref='auto'):
+    """その動画（Station）の Season フォルダの名前。既定値の {Folder} に入る。
+
+    CSV に Season_sub_folder 列があり、同じ Station の行がすべて同じ値なら、その値を使う
+    （Station のフォルダがどの Season フォルダにあるかを、CSV の記録に合わせる）。
+    なければ、CSV に足す行のもとにするファイルが入っている Season フォルダの名前。
+    """
+    sub = (csv_meta or {}).get('station_sub') or {}
+    v = sub.get(it['station'].casefold())
+    if v:
+        return v
+    ref = ref_file(it['files'], used, ext_ref, it.get('pick') or '')
+    if ref:
+        return season_dir_of(ref[1], season)
+    return season
+
+
+def add_row_defaults(csv_meta, settings, season, folder=FOLDER_LABEL):
     """CSV に足す行の既定値を、列の位置ごとに返す（{列番号: 値}）。
 
     Season、Station、File、DateTime の列には入れない。CSV の見出しにない列名は無視する。
-    同じ見出しが複数あるときは、最初の列に入れる。値の中の {Season} は Season 名に置き換える。
+    同じ見出しが複数あるときは、最初の列に入れる。値の中の {Season} は Season 名に、
+    {Folder} は folder（その動画の Season フォルダの名前。season_folder_for で求める）に置き換える。
     """
     header = csv_meta['header']
     cols = {h.strip().casefold(): i for i, h in reversed(list(enumerate(header)))}
@@ -1057,7 +1227,7 @@ def add_row_defaults(csv_meta, settings, season):
     for name, val in (settings.get('add_defaults') or {}).items():
         i = cols.get(str(name).strip().casefold())
         if i is not None and i not in skip and str(val) != '':
-            out[i] = season_path(str(val), season)
+            out[i] = re.sub(r'\{folder\}', lambda m: folder, season_path(str(val), season), flags=re.I)
     return out
 
 
@@ -1138,15 +1308,21 @@ def item_detail(store, season, item_id):
             fl = it['files'].get(s['id']) or []
             srcs.append({'id': s['id'], 'name': s['name'], 'type': 'folder', 'files': [
                 {'n': i, 'name': f[0], 'size': f[1], 'mtime': f[2], 'ext': ext_of(f[0]),
+                 'folder': season_dir_of(f, meta['season']), 'station_dir': f[3],
+                 'pick': pick_id(s['id'], f, fl),
                  'path': file_path(s, meta['season'], f)} for i, f in enumerate(fl)]})
         else:
             srcs.append({'id': s['id'], 'name': s['name'], 'type': 'csv', 'csv': it['csv']})
     ext_ref = cfg['settings'].get('ext_ref', 'auto')
     ref = ref_file(it['files'], used, ext_ref, it['pick'])
+    chosen = picked_file(it['files'], used, it['pick'])
     return {
         'id': it['id'], 'station': it['station'], 'stem': it['stem'], 'mask': it['mask'],
         'flags': it['flags'] | csvext_flag(it['files'], it['csv'], used, ext_ref, it['pick']),
-        'decision': it['decision'], 'memo': it['memo'], 'pick': it['pick'],
+        'decision': it['decision'], 'memo': it['memo'],
+        # 選ばれているファイルの pick（画面のラジオボタンの値と同じ形にそろえる）
+        'pick': (pick_id(chosen[0]['id'], chosen[1], it['files'].get(chosen[0]['id']) or [])
+                 if chosen else it['pick']),
         'csv_fields': it['csv_fields'], 'decided_at': it['decided_at'], 'sources': srcs,
         'embedded': {
             'text': embedded_text(it, cfg['settings']['embedded_tz'], fmt) if any(it['files'].values()) else '',
@@ -1161,6 +1337,10 @@ def item_detail(store, season, item_id):
                  'dt_source': cfg['settings'].get('dt_source', 'embedded')},
         'ref': {'src': ref[0]['id'], 'name': ref[1][0]} if ref else None,
         'header': csv_meta['header'] if csv_meta else [],
+        # CSV に足す行の既定値（列番号 -> 値）。{Folder} は、この動画の Season フォルダの名前にしてある
+        'defaults': ({str(i): v for i, v in add_row_defaults(
+            csv_meta, cfg['settings'], meta['season'],
+            season_folder_for(it, used, csv_meta, meta['season'], ext_ref)).items()} if csv_meta else {}),
     }
 
 
@@ -1255,7 +1435,7 @@ def export_result(store, season):
                 for b, s in enumerate(used):
                     present = bool(it['mask'] >> b & 1)
                     pat.append('%s:%s' % (s['name'], 'あり' if present else 'なし'))
-                    row += _source_values(it, s)
+                    row += _source_values(it, s, meta['season'])
                 flags = it['flags'] | csvext_flag(it['files'], it['csv'], used, ext_ref, it['pick'])
                 row += [' '.join(pat), _state_text(flags), DECISION_LABELS.get(it['decision'], ''),
                         it['memo'], it['pick'], it['decided_at']]
@@ -1275,15 +1455,16 @@ _ITEM_COLS = ('id, key, station, stem, mask, flags, files, csv, decision, memo, 
 
 def _source_columns(s):
     if s['type'] == 'folder':
-        return [s['name'] + '_file', s['name'] + '_size', s['name'] + '_mtime']
+        return [s['name'] + '_file', s['name'] + '_folder', s['name'] + '_size', s['name'] + '_mtime']
     return [s['name'] + '_file', s['name'] + '_rows', s['name'] + '_DateTime']
 
 
-def _source_values(it, s):
+def _source_values(it, s, season):
+    """照合結果の一覧の、保存場所ごとの列。_folder は、そのファイルが入っている Season フォルダの名前。"""
     if s['type'] == 'folder':
         fl = it['files'].get(s['id']) or []
-        return [' | '.join(x[0] for x in fl), ' | '.join(str(x[1]) for x in fl),
-                ' | '.join(mtime_text(x[2]) for x in fl)]
+        return [' | '.join(x[0] for x in fl), ' | '.join(season_dir_of(x, season) for x in fl),
+                ' | '.join(str(x[1]) for x in fl), ' | '.join(mtime_text(x[2]) for x in fl)]
     cj = it['csv']
     return [cj['file'], cj['n'], cj['dt']] if cj else ['', '', '']
 
@@ -1378,7 +1559,8 @@ def export_all(store, opts=None, job=None):
                     for b, x in enumerate(used):
                         pat.append('%s:%s' % (x['name'], 'あり' if it['mask'] >> b & 1 else 'なし'))
                         at = col_of[(x['type'], x['name'].casefold())]
-                        cells[at:at + 3] = _source_values(it, x)
+                        vals = _source_values(it, x, meta['season'])
+                        cells[at:at + len(vals)] = vals
                     flags = it['flags'] | csvext_flag(it['files'], it['csv'], used, ext_ref, it['pick'])
                     w.writerow([meta['season'], it['station'], it['stem']] + cells +
                                [' '.join(pat), _state_text(flags), DECISION_LABELS.get(it['decision'], ''),
@@ -1402,6 +1584,13 @@ def export_all(store, opts=None, job=None):
     return {'path': path, 'summary_path': summary_path, 'rows': n, 'seasons': len(summ['seasons']),
             'scope': scope, 'skipped': summ['skipped'], 'totals': summ['totals'],
             'empty': [c['season'] for c in summ['seasons'] if not c['videos']]}
+
+
+def season_matcher(meta):
+    """CSV の Season 列の値がこの Season のものかを決める関数。走査のときと同じ規則を使う。"""
+    by_prefix = bool(meta.get('season_prefix', False))      # 0.2.0 以前の走査結果は、名前の全体で照合している
+    cf = season_key(meta['season'], by_prefix).casefold()
+    return lambda value: season_key(value, by_prefix).casefold() == cf
 
 
 def _check_csv_unchanged(csv_meta):
@@ -1506,7 +1695,10 @@ def export_csv(store, season, opts, job):
         prof = dt_profile(con, meta)
         minute_only = bool(prof and prof['minute_only'])
         station_names = csv_meta.get('station_names') or {}
-        defaults = add_row_defaults(csv_meta, settings, meta['season'])
+        # Season 列は、CSV の既存の行と同じ綴りにする。行によって綴りが違うときは、同じ Station の行の綴り、
+        # それも決まらなければ Season 名
+        season_text = csv_meta.get('season_name') or meta['season']
+        station_season = csv_meta.get('station_season') or {}
         for n, it in enumerate(to_add, 1):
             ensure_embedded(con, meta, it)
             if it.get('dt_unreadable'):
@@ -1515,6 +1707,8 @@ def export_csv(store, season, opts, job):
                 con.commit()
                 job.update(done=n)
             fields = [''] * len(header)
+            defaults = add_row_defaults(csv_meta, settings, meta['season'],
+                                        season_folder_for(it, used, csv_meta, meta['season'], ext_ref))
             for i, val in defaults.items():
                 fields[i] = val
             # 行ごとに入力された値は、既定値より優先する
@@ -1522,7 +1716,7 @@ def export_csv(store, season, opts, job):
                 i = cols.get(name.strip().casefold())
                 if i is not None and i not in (csv_meta['i_season'], csv_meta['i_station'], csv_meta['i_file']):
                     fields[i] = val
-            fields[csv_meta['i_season']] = meta['season']
+            fields[csv_meta['i_season']] = station_season.get(it['station'].casefold()) or season_text
             # Station は、CSV にすでにある綴りがあればそれに合わせる
             fields[csv_meta['i_station']] = station_names.get(it['station'].casefold(), it['station'])
             fields[csv_meta['i_file']] = ref_file(it['files'], used, ext_ref, it['pick'])[1][0]
@@ -1559,7 +1753,8 @@ def export_csv(store, season, opts, job):
     try:
         res = tm_csv.write_updated(csv_meta['path'], dst, csv_meta, meta['season'], keyfunc,
                                    remove_keys, ext_new, add_rows, removed_path, prog,
-                                   marks=(i_mark, settings['mark_text'], mark_keys) if mark_keys else None)
+                                   marks=(i_mark, settings['mark_text'], mark_keys) if mark_keys else None,
+                                   match=season_matcher(meta))
     except UnicodeEncodeError as e:
         raise ValueError('追加する行に、CSV の文字コード（%s）で表せない文字があります: %r'
                          % (csv_meta['encoding'], e.object[e.start:e.end]))
@@ -1598,6 +1793,31 @@ def export_plan(store, season):
         summary = {'copy': {}, 'quarantine': {}, 'csv_add': 0, 'csv_remove': 0, 'csv_ext': 0,
                    'csv_mark': 0, 'manual': 0, 'undecided': 0}
         i_mark = mark_column(meta.get('csv'), cfg['settings'])
+        info = meta.get('info') or {}
+        sdirs = info.get('season_dirs') or {}
+        stdirs = info.get('station_dirs') or {}
+
+        def copy_to(s, it, f):
+            """コピー先のパスと、確かめてほしいことがあるときの注記。
+
+            コピー先にその Station のフォルダがあれば、そこへ入れる。なければ、コピー先の Season フォルダ
+            （1 つならそれ、複数ならコピー元と同じ名前のもの）の下に Station のフォルダを作る形にする。
+            """
+            known = (stdirs.get(s['id']) or {}).get(it['station'].casefold())
+            if known:
+                return os.path.join(s['path'], known[0], known[1], f[0]), ''
+            dirs = sdirs.get(s['id']) or []
+            from_dir = season_dir_of(f, ssn)
+            if len(dirs) == 1:
+                return os.path.join(s['path'], dirs[0], it['station'], f[0]), ''
+            if not dirs:
+                return os.path.join(s['path'], from_dir, it['station'], f[0]), ''
+            same = [d for d in dirs if d.casefold() == from_dir.casefold()]
+            if same:
+                return os.path.join(s['path'], same[0], it['station'], f[0]), ''
+            return (os.path.join(s['path'], dirs[0], it['station'], f[0]),
+                    'コピー先に Season フォルダが複数あります（%s）。入れるフォルダを確かめてください' % '、'.join(dirs))
+
         for it in _iter_items(con):
             flags = it['flags']
             cj = it['csv']
@@ -1630,25 +1850,28 @@ def export_plan(store, season):
                 for s in folders:
                     fl = it['files'].get(s['id']) or []
                     note = '参照のみの保存場所（手作業）' if s.get('readonly') else ''
-                    dst = os.path.join(s['path'], ssn, it['station'], f[0])
+                    dst, check = copy_to(s, it, f)
+                    cnote = '。'.join(x for x in (note, check) if x)
                     if not fl:
-                        rows.append(['コピー', it['station'], it['stem'], file_path(src, ssn, f), dst, f[1], note])
+                        rows.append(['コピー', it['station'], it['stem'], file_path(src, ssn, f), dst, f[1], cnote])
                         c = summary['copy'].setdefault(s['name'], [0, 0])
                         c[0] += 1
                         c[1] += f[1]
                     elif pick is not None:
                         for g in fl:
-                            if s['id'] == src['id'] and g[0] == f[0]:
+                            if s['id'] == src['id'] and g is f:
                                 continue
                             same = ext_of(g[0]).lower() == ext_of(f[0]).lower()
                             if (same and g[1] != f[1]) or (s['id'] == src['id']):
-                                q = os.path.join(quarantine_root(s), ssn, g[3], g[0])
+                                q = os.path.join(quarantine_root(s), season_dir_of(g, ssn), g[3], g[0])
                                 rows.append(['退避', it['station'], it['stem'], file_path(s, ssn, g), q, g[1], note])
                                 c = summary['quarantine'].setdefault(s['name'], [0, 0])
                                 c[0] += 1
                                 c[1] += g[1]
                                 if same and s['id'] != src['id']:
-                                    rows.append(['コピー', it['station'], it['stem'], file_path(src, ssn, f), dst, f[1], note])
+                                    # 置き換え: 退避したファイルと同じフォルダへ入れる
+                                    rdst = os.path.join(s['path'], season_dir_of(g, ssn), g[3], f[0])
+                                    rows.append(['コピー', it['station'], it['stem'], file_path(src, ssn, f), rdst, f[1], note])
                                     c = summary['copy'].setdefault(s['name'], [0, 0])
                                     c[0] += 1
                                     c[1] += f[1]
@@ -1660,7 +1883,7 @@ def export_plan(store, season):
                 for s in folders:
                     note = '参照のみの保存場所（手作業）' if s.get('readonly') else ''
                     for g in it['files'].get(s['id']) or []:
-                        q = os.path.join(quarantine_root(s), ssn, g[3], g[0])
+                        q = os.path.join(quarantine_root(s), season_dir_of(g, ssn), g[3], g[0])
                         rows.append(['退避', it['station'], it['stem'], file_path(s, ssn, g), q, g[1], note])
                         c = summary['quarantine'].setdefault(s['name'], [0, 0])
                         c[0] += 1
