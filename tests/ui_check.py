@@ -58,6 +58,7 @@ def add_split_season(tree):
     fixture.put(H('N250102_P02', 'BSN0004', 'IMG_0001.AVI'), a)           # HDD にしかない
     for st, name in (('BSN0001', 'IMG_0001.AVI'), ('BSN0001', 'IMG_0002.AVI'), ('BSN0003', 'IMG_0001.AVI')):
         fixture.put(N(st, name), a)
+    fixture.put(N('BSN0003', 'IMG_0002.AVI'), a)                          # NAS にしかなく、CSV にもない
     lines = ['N250102,%s,%s,2025/01/05 06:07:08,deer,' % x for x in
              (('BSN0001', 'IMG_0001.AVI'), ('BSN0001', 'IMG_0002.AVI'), ('BSN0003', 'IMG_0001.AVI'))]
     with open(tree['csv'], 'a', encoding='utf-8', newline='') as f:
@@ -504,7 +505,7 @@ def main():
             check('NAS' not in note, 'フォルダ名が Season 名と同じ保存場所は、知らせに出さない')
             check('Season フォルダ: N250102_P01、N250102_P02' in page.get_attribute('#thead .src', 'title'), '見出しの補足にフォルダ名が出る')
             got = page.evaluate("TM.S.rows.map(r => TM.S.data.stations[r.st] + '/' + r.stem + ':' + r.flags)")
-            check(got == ['BSN0001/IMG_0001:12', 'BSN0001/IMG_0002:0', 'BSN0003/IMG_0001:0', 'BSN0004/IMG_0001:1'],
+            check(got == ['BSN0001/IMG_0001:12', 'BSN0001/IMG_0002:0', 'BSN0003/IMG_0001:0', 'BSN0003/IMG_0002:1', 'BSN0004/IMG_0001:1'],
                   '2 つのフォルダの動画が 1 つの Season として照合される（%s）' % got)
             page.wait_for_selector('#detail input[name="pick"]')
             dtext = page.inner_text('#detail')
@@ -525,6 +526,49 @@ def main():
             page.screenshot(path=os.path.join(out, '16_settings_prefix.png'), full_page=True)
             page.keyboard.press('Escape')
             page.wait_for_timeout(200)
+
+            # 14. 元の CSV に行を書き足す（残すと判断した、NAS にあって CSV にない動画）
+            st, pl = c.get('/api/items?season=N250102')
+            byname = {(pl['stations'][a[1]], a[2]): a[0] for a in pl['items']}
+            c.post('/api/decide', {'season': 'N250102', 'decision': 'keep',
+                                   'ids': [byname[('BSN0003', 'IMG_0002')], byname[('BSN0004', 'IMG_0001')]]})
+            page.reload()
+            page.wait_for_selector('.row', timeout=10000)
+            csv_before = open(tree['csv'], 'rb').read()
+            check(page.inner_text('#btnExport') == '書き出しと実行', '上のボタンは「書き出しと実行」')
+            page.click('#btnExport')
+            page.wait_for_selector('#exAddBox [data-ex="csvadd"]')
+            box = page.inner_text('#exAddBox')
+            check('NAS にあって CSV に行がないもの' in box and tree['csv'] in box and page.inner_text('#exAddN') == '1 本',
+                  '書き出しの窓に、CSV に行を追加する対象の本数が出る')
+            check('1 本は、NAS にないので対象外' in box, 'NAS にない動画は対象外と知らせる')
+            check(page.inner_text('#exAddBox [data-ex="csvadd"]') == 'CSV に 1 行を追加する', '実行のボタンに行数が出る')
+            page.click('#exAddBox [data-ex="csvadd"]')
+            page.wait_for_selector('#exAddConfirm')
+            check('末尾に、1 行を書き足します' in page.inner_text('#exAddConfirm') and open(tree['csv'], 'rb').read() == csv_before,
+                  '実行の前に確認が出て、まだ CSV は変わらない')
+            page.screenshot(path=os.path.join(out, '17_csv_add_confirm.png'), full_page=True)
+            page.click('[data-ex="csvadd-cancel"]')
+            page.wait_for_timeout(300)
+            check(page.locator('#exAddConfirm').count() == 0 and open(tree['csv'], 'rb').read() == csv_before, '「やめる」で何もしない')
+            page.click('#exAddBox [data-ex="csvadd"]')
+            page.click('[data-ex="csvadd-go"]')
+            page.wait_for_selector('#exAddOut .result', timeout=20000)
+            page.wait_for_function("document.getElementById('exAddN') && document.getElementById('exAddN').textContent === '0 本'")
+            outt = page.inner_text('#exAddOut')
+            check('CSV に行を書き足しました' in outt and '対象 1 本のうち、1 行を書き足しました' in outt
+                  and '1 行すべてが動画の行として読めることを確かめました' in outt and '書き込む前の CSV の控え' in outt
+                  and '書き足した行の記録' in outt, '書き足しの結果、控え、記録が出る')
+            csv_after = open(tree['csv'], 'rb').read()
+            added_text = csv_after[len(csv_before):].decode('utf-8')
+            check(csv_after.startswith(csv_before) and added_text == 'N250102,BSN0003,IMG_0002.AVI,2026/01/05 06:07:08,New,from N250102\r\n',
+                  '元の CSV の末尾に 1 行だけが足され、すでにあった内容は変わらない（%r）' % added_text)
+            check(page.is_disabled('#exAddBox [data-ex="csvadd"]'), '書き足したあとは、対象が 0 本になりボタンが押せない')
+            page.screenshot(path=os.path.join(out, '18_csv_add_done.png'), full_page=True)
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+            got = page.evaluate("TM.S.rows.filter(r => r.stem === 'IMG_0002' && TM.S.data.stations[r.st] === 'BSN0003').map(r => [r.mask, r.dec])")
+            check(got == [[6, 'k']], '一覧にも、CSV に行が付いたことが出る（%s）' % got)
             for ln in logs:
                 print('console', ln)
             check(not [ln for ln in logs if 'pageerror' in ln or ln.startswith('error')], 'ブラウザのエラーがない')

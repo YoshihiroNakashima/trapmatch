@@ -260,6 +260,94 @@ def add_mark(old, text):
     return cur + '; ' + text
 
 
+def text_encoding(enc):
+    """行を書き足すときの文字コード。先頭に BOM がある UTF-8 でも、途中に BOM は書かない。"""
+    return 'utf-8' if enc.lower().replace('_', '-') == 'utf-8-sig' else enc
+
+
+def rows_text(meta, rows):
+    """行（列の値のリスト）を、その CSV の区切り、引用符の付け方、改行にそろえた文字列にする。"""
+    eol = meta.get('eol') or '\n'
+    qa = meta.get('quote_all', False)
+    return ''.join(serialize(fields, meta['delimiter'], qa) + eol for fields in rows)
+
+
+class CsvChanged(ValueError):
+    """書き足そうとした CSV が、確かめたときの状態から変わっていた。"""
+
+
+class AppendFailed(OSError):
+    """書き足しに失敗した。restored は、CSV を書き足す前の長さに戻せたかどうか。"""
+
+    def __init__(self, message, restored):
+        OSError.__init__(self, message)
+        self.restored = restored
+
+
+def append_rows(path, meta, rows, expect=None):
+    """CSV の末尾に行を書き足す。すでにある内容は 1 バイトも書き換えない。
+
+    expect に (サイズ, 更新日時の秒) を渡すと、その状態から変わっていたら書かずに CsvChanged を出す。
+    書いたあと、元の部分の長さと、書き足した内容を読み返して確かめる。
+    途中で失敗したときは、書きかけの分だけを取り除いてから AppendFailed を出す。
+    戻り値は {'old_size', 'new_size', 'new_mtime', 'added', 'text'}（text は書き足した文字列）。
+    """
+    st = os.stat(path)
+    if expect is not None and (st.st_size, int(st.st_mtime)) != (int(expect[0]), int(expect[1])):
+        raise CsvChanged('CSV が、読み込んだあとに変更されています')
+    old = st.st_size
+    text = ''
+    if old:
+        with open(path, 'rb') as f:
+            f.seek(old - 1)
+            if f.read(1) not in (b'\n', b'\r'):
+                text = meta.get('eol') or '\n'       # 最後の行に改行がない: 行がつながらないように足す
+    text += rows_text(meta, rows)
+    data = text.encode(text_encoding(meta['encoding']))
+    if not rows:
+        return {'old_size': old, 'new_size': old, 'new_mtime': int(st.st_mtime), 'added': 0, 'text': ''}
+    try:
+        with open(path, 'ab') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(path, 'rb') as f:
+            f.seek(old)
+            back = f.read(len(data) + 1)
+        if back != data:
+            raise OSError('書き足した内容を読み返したところ、書いた内容と一致しませんでした')
+    except OSError as e:
+        raise AppendFailed('%s' % (e.strerror or e), _drop_partial(path, old, data))
+    except BaseException:
+        _drop_partial(path, old, data)
+        raise
+    st2 = os.stat(path)
+    return {'old_size': old, 'new_size': st2.st_size, 'new_mtime': int(st2.st_mtime), 'added': len(rows),
+            'text': text}
+
+
+def _drop_partial(path, old, data):
+    """書き足しに失敗したとき、元の長さに戻す。
+
+    元の長さより後ろにあるのが、こちらが書こうとした内容の先頭部分だけのときに限る
+    （ほかのプログラムが書いた内容を消さないため）。戻せたら True。
+    """
+    try:
+        size = os.path.getsize(path)
+        if size <= old:
+            return True
+        with open(path, 'rb') as f:
+            f.seek(old)
+            tail = f.read(len(data) + 1)
+        if not data.startswith(tail):
+            return False
+        with open(path, 'r+b') as f:
+            f.truncate(old)
+        return True
+    except OSError:
+        return False
+
+
 def write_updated(src, dst, meta, season, keyfunc, remove_keys, ext_new, add_rows,
                   removed_path=None, progress=None, marks=None, match=None):
     """src を読みながら、変更を反映した CSV を dst に書く。

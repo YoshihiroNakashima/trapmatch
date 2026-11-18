@@ -366,15 +366,23 @@ def test_export_csv(tree, tmp_path):
     assert open(res2['path'], 'rb').read() == orig
 
 
-def test_export_csv_rejects_changed_csv(tree, tmp_path):
+def test_export_csv_rereads_changed_csv(tree, tmp_path):
+    """CSV が走査のあとに変わっていたら、古い内容のまま書き出さず、CSV を読み直してから書き出す。"""
     import shutil
     csv2 = str(tmp_path / 'copy.csv')
     shutil.copy(tree['csv'], csv2)
     t2 = dict(tree, csv=csv2)
     store = make_store(tmp_path, t2)
     scan(store)
+    n0 = len(tm_core.load_payload(store, fixture.SEASON)['items'])
     with open(csv2, 'ab') as f:
         f.write(b'N260101,BSN0009,IMG_0001.AVI,,,\r\n')
+    res = tm_core.export_csv(store, fixture.SEASON, {}, tm_core.Job('x', fixture.SEASON))
+    assert res['refreshed'] and open(res['path'], 'rb').read().endswith(b'N260101,BSN0009,IMG_0001.AVI,,,\r\n')
+    p = tm_core.load_payload(store, fixture.SEASON)
+    assert len(p['items']) == n0 + 1 and by_name(p)[('BSN0009', 'IMG_0001')][4] == tm_core.F_CSVONLY
+    # CSV がなくなっていれば、書き出さない
+    os.remove(csv2)
     with pytest.raises(ValueError):
         tm_core.export_csv(store, fixture.SEASON, {}, tm_core.Job('x', fixture.SEASON))
 

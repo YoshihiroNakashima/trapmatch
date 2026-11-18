@@ -21,7 +21,7 @@
   const DEC_API = { '': '', k: 'keep', d: 'delete', e: 'except' };
   const DEC_CODE = { '': '', keep: 'k', delete: 'd', except: 'e' };
   const ROW_H = 28;
-  const UI_VERSION = '0.3.0';      // この画面のプログラムの版（tm_core.py の VERSION と同じにする）
+  const UI_VERSION = '0.4.0';      // この画面のプログラムの版（tm_core.py の VERSION と同じにする）
 
   const S = {
     cfg: null, ffmpeg: false, dataDir: '', season: '', data: null, busy: false,
@@ -586,7 +586,7 @@
     $('status').innerHTML =
       `<span>全 <b>${nf(rows.length)}</b> 本</span><span>判断が必要 <b>${nf(needs)}</b> 本</span>` +
       `<span>未判断 <b>${nf(und)}</b> 本</span><span>残す <b>${nf(k)}</b></span><span>削除する <b>${nf(d)}</b></span>` +
-      `<span>例外 <b>${nf(e)}</b></span><span class="right">この版は保存場所のファイルを変更しません</span>`;
+      `<span>例外 <b>${nf(e)}</b></span><span class="right">この版は動画のファイルを変更しません</span>`;
   }
 
   // ------------------------------------------------------------ 選択
@@ -894,7 +894,7 @@
     if (hasCsvSource && !csvInfo && d.ref && data.csv) {
       const fixed = new Set(data.csv.fixed_cols);
       h += '<div class="dsec"><h4>CSV に足す行</h4>' +
-        `<p class="hint">「残す」と判断すると、Season、Station、File（${esc(d.ref.name)}）を埋めた行が更新後の CSV に入ります。</p>`;
+        `<p class="hint">「残す」と判断すると、Season、Station、File（${esc(d.ref.name)}）を埋めた行を CSV に足せます（「書き出しと実行」から、更新後の CSV の書き出しか、元の CSV への行の追加で）。</p>`;
       if (data.csv.has_dt && d.fill) h += fillHint(d);
       const defs = d.defaults || data.csv.defaults || {};
       if (Object.keys(defs).length) {
@@ -1229,6 +1229,10 @@
       return;
     }
     if (j.kind === 'scan') { refreshSeasons(); loadSeason((j.result && j.result.season) || j.season); }
+    if (j.kind === 'csv_add') {
+      loadSeason(S.season || j.season);
+      if (j.result) toast(`CSV に ${nf(j.result.added)} 行を書き足しました`);
+    }
   }
   // Season を見分ける名前。先頭の英字 1 文字と数字 6 桁だけを使う設定なら、その後ろを落とす（N250102_P01 -> N250102）
   function seasonKey(name, byPrefix) {
@@ -1490,6 +1494,49 @@
     return `<div class="result"><b>${esc(title)}</b>${extra || ''}<div class="path">${esc(path)}</div>` +
       `<button class="link" data-openpath="${esc(path)}">保存先のフォルダを開く</button></div>`;
   }
+  // 書き出しの窓: 元の CSV に行を書き足す（実行）
+  function csvAddHtml(c) {
+    const names = c.basis.map((b) => b.name).join('、');
+    let h = '<p>「残す」と判断した動画のうち、' + (names ? `<b>${esc(names)}</b> ` : '基準の保存場所') +
+      `にあって CSV に行がないものの行を、元の CSV（${esc(c.path)}）の末尾に書き足します。すでにある行は変更しません。` +
+      '書き込む前に CSV の控えを作り、書いたあとに CSV を読み直して確かめます。</p>';
+    h += '<label class="setrow">動画があることを確かめる保存場所<select id="exAddSrc">' +
+      `<option value="auto"${c.choice === 'auto' ? ' selected' : ''}>自動（名前に NAS を含む保存場所）</option>` +
+      c.folders.map((f) => `<option value="${esc(f.id)}"${c.choice === f.id ? ' selected' : ''}>${esc(f.name)}</option>`).join('') +
+      '</select></label>';
+    let block = '';
+    if (!c.basis.length) block = '名前に NAS を含む保存場所がありません。動画があることを確かめる保存場所を選んでください。';
+    else if (c.sources_changed) block = '保存場所の登録が、走査のあとに変わっています。「走査」をやり直してから実行してください。';
+    else if (!c.exists) block = 'CSV が見つかりません。';
+    if (block) h += `<div class="warnbox">${esc(block)}</div>`;
+    h += `<div class="setrow">対象<b id="exAddN">${nf(c.target)} 本</b></div>`;
+    if (c.elsewhere) h += `<p class="hint">「残す」と判断した CSV にない動画のうち ${nf(c.elsewhere)} 本は、${esc(names || '基準の保存場所')} にないので対象外です（コピーしたあとで追加できます）。</p>`;
+    if (c.changed) h += '<p class="hint">CSV が走査のあとに変わっています。実行のときに CSV を読み直してから対象を決めるので、本数が変わることがあります。</p>';
+    h += '<p class="hint">追加する行の DateTime とほかの列には、上の「更新後の CSV」と同じ決まりの値が入ります。</p>';
+    h += `<div class="setrow"><button data-ex="csvadd"${block || !c.target ? ' disabled' : ''}>CSV に ${nf(c.target)} 行を追加する</button></div>`;
+    return h;
+  }
+  function csvAddResultHtml(r) {
+    const basis = r.basis.join('、');
+    let x = `<div>対象 ${nf(r.targets)} 本のうち、${nf(r.added)} 行を書き足しました。</div>`;
+    if (r.added && (r.added_embedded || r.added_mtime || r.added_na)) {
+      x += `<div>DateTime: 埋め込まれた撮影日時から ${nf(r.added_embedded)} 行、ファイルの更新日時から ${nf(r.added_mtime)} 行、NA ${nf(r.added_na)} 行</div>`;
+    }
+    if (r.added && !r.refresh_error) {
+      x += r.verified === r.added
+        ? `<div>CSV を読み直して、書き足した ${nf(r.added)} 行すべてが動画の行として読めることを確かめました。</div>`
+        : `<div class="warnbox">書き足した ${nf(r.added)} 行のうち、読み直して確かめられたのは ${nf(r.verified)} 行です。CSV の末尾を確かめてください（${esc(r.unverified.join('、'))}）。</div>`;
+    }
+    let h = r.added ? resultHtml('CSV に行を書き足しました', r.path, x)
+      : `<div class="result"><b>書き足す行はありませんでした</b><div>対象 ${nf(r.targets)} 本。CSV は変更していません。</div></div>`;
+    if (r.refresh_error) h += `<div class="warnbox">書き足しは済みましたが、CSV の読み直しに失敗しました（${esc(r.refresh_error)}）。「走査」をやり直してください。</div>`;
+    if (r.changed) h += `<div class="warnbox">${nf(r.changed)} 本は、${esc(basis)} に走査のときと同じファイルが見つからなかったため、書き足していません。「走査」をやり直して確かめてください。</div>`;
+    if (r.unreadable) h += `<div class="warnbox">${nf(r.unreadable)} 本は、動画を読めず撮影日時を確かめられなかったため、書き足していません。` +
+      (r.offline.length ? `${esc(r.offline.join('、'))} に接続できません。` : '') + '接続を確かめて、もう一度実行してください。</div>';
+    if (r.backup) h += resultHtml(r.backup_new ? '書き込む前の CSV の控え' : '書き込む前の CSV の控え（今日の最初の書き足しの前に作ったもの）', r.backup);
+    if (r.record) h += resultHtml('書き足した行の記録', r.record);
+    return h;
+  }
   // 書き出しの窓: 追加する行の DateTime の取得元と、その根拠
   function dtSourceHtml(counts) {
     const src = counts.dt_source || 'embedded';
@@ -1536,12 +1583,13 @@
   async function openExport() {
     const d = S.data;
     if (!d) { toast('先に Season を走査してください'); return; }
-    let counts = null, cerr = '', all = null;
+    let counts = null, cerr = '', all = null, addc = null, aerr = '';
     if (d.csv) {
       try { counts = await api('/api/export', { season: S.season, kind: 'csv_counts' }); } catch (e) { cerr = e.message; }
+      try { addc = await api('/api/export', { season: S.season, kind: 'csv_add_counts' }); } catch (e) { aerr = e.message; }
     }
     try { all = await api('/api/export', { season: S.season, kind: 'all_counts' }); } catch (e) { all = null; }
-    let h = `<h2>書き出し ${esc(d.season)}</h2><p class="muted">どの書き出しも、保存場所のファイルと元の CSV を変更しません。ファイルは作業用の保存先に作られます。</p>`;
+    let h = `<h2>書き出しと実行 ${esc(d.season)}</h2><p class="muted">「CSV に行を追加する」のほかは、保存場所のファイルと元の CSV を変更しません。書き出したファイルは作業用の保存先に作られます。</p>`;
     h += '<h3>照合結果の一覧</h3><p>全動画の所在、状態、判断、メモを CSV にします。</p><div class="setrow"><button data-ex="result">一覧を書き出す</button></div><div id="exResult"></div>';
     h += '<h3>更新後の CSV</h3>';
     if (!d.csv) h += '<p class="muted">CSV が保存場所に登録されていないため、使えません。</p>';
@@ -1558,7 +1606,8 @@
         '<div class="setrow"><button data-ex="csv">更新後の CSV を書き出す</button>' +
         (counts.has_dt ? '<button data-ex="dtcheck">埋め込みの日時を既存の DateTime と突き合わせる</button>' : '') + '</div><div id="exCsv"></div>';
     }
-    h += '<h3>実行計画（確認用）</h3><p>判断どおりにそろえるために必要なコピーと退避の一覧です。この版は実行しません。</p>' +
+    if (d.csv) h += '<h3>CSV に行を追加する（元の CSV に書き込みます）</h3><div id="exAddBox">' + (addc ? csvAddHtml(addc) : `<div class="errbox">${esc(aerr)}</div>`) + '</div><div id="exAddOut"></div>';
+    h += '<h3>実行計画（確認用）</h3><p>判断どおりにそろえるために必要なコピーと退避の一覧です。コピーと退避は、この版では実行しません。</p>' +
       '<div class="setrow"><button data-ex="plan">実行計画を書き出す</button></div><div id="exPlan"></div>';
     if (all && all.seasons.length) {
       const t = all.totals;
@@ -1570,7 +1619,20 @@
     }
     h += '<div class="mfoot"><button class="primary" data-close>閉じる</button></div>';
     const box = openModal(h);
-    box.onchange = (e) => { if (e.target.id === 'exDtSrc') setDtSource(e.target.value); };
+    box.onchange = async (e) => {
+      if (e.target.id === 'exDtSrc') setDtSource(e.target.value);
+      if (e.target.id === 'exAddSrc') {
+        // 動画があることを確かめる保存場所を変えた: 設定に保存して、対象の本数を出し直す
+        const cfg = JSON.parse(JSON.stringify(S.cfg));
+        cfg.settings.csv_add_source = e.target.value;
+        try {
+          S.cfg = (await api('/api/config', cfg)).config;
+          addc = await api('/api/export', { season: S.season, kind: 'csv_add_counts' });
+          document.getElementById('exAddBox').innerHTML = csvAddHtml(addc);
+          document.getElementById('exAddOut').innerHTML = '';
+        } catch (err) { toast(err.message, true); }
+      }
+    };
     box.onclick = async (e) => {
       const t = e.target;
       if (t.dataset.close !== undefined) { closeModal(); return; }
@@ -1578,6 +1640,32 @@
       const ex = t.dataset.ex;
       if (!ex) return;
       try {
+        if (ex === 'csvadd') {
+          // まず確認を出す。書き足すのは「書き足す」を押したときだけ
+          document.getElementById('exAddOut').innerHTML = '<div class="warnbox" id="exAddConfirm">' +
+            `元の CSV（${esc(addc.path)}）の末尾に、${nf(addc.target)} 行を書き足します。すでにある行は変更しません。よろしいですか。` +
+            '<div class="setrow"><button class="primary" data-ex="csvadd-go">書き足す</button><button data-ex="csvadd-cancel">やめる</button></div></div>';
+          return;
+        }
+        if (ex === 'csvadd-cancel') { document.getElementById('exAddOut').innerHTML = ''; return; }
+        if (ex === 'csvadd-go') {
+          await flushSaves();      // 入力中の「CSV に足す行」の値を先に保存する
+          await api('/api/export', { season: S.season, kind: 'csv_add', confirm: true });
+          for (const b of box.querySelectorAll('[data-ex]')) b.disabled = true;
+          document.getElementById('exAddOut').innerHTML = '<p class="hint" id="exAddProg">処理中</p>';
+          watchJob((j) => {
+            for (const b of box.querySelectorAll('[data-ex]')) b.disabled = false;
+            loadSeason(S.season);      // 一覧を、書き足したあとの状態にする
+            const out = document.getElementById('exAddOut');
+            if (!out) return;
+            const ab = document.getElementById('exAddBox');
+            if (j.state === 'error') { out.innerHTML = `<div class="errbox">${esc(j.error || '')}</div>`; return; }
+            out.innerHTML = csvAddResultHtml(j.result);
+            // 対象の本数を出し直す
+            api('/api/export', { season: S.season, kind: 'csv_add_counts' }).then((c) => { addc = c; if (ab) ab.innerHTML = csvAddHtml(c); }).catch(() => {});
+          }, (text) => { const el = document.getElementById('exAddProg'); if (el) el.textContent = text; });
+          return;
+        }
         if (ex === 'result') {
           const r = await api('/api/export', { season: S.season, kind: 'result' });
           document.getElementById('exResult').innerHTML = resultHtml(`${nf(r.rows)} 本を書き出しました`, r.path);
@@ -1624,7 +1712,9 @@
             if (j.state === 'error') { out.innerHTML = `<div class="errbox">${esc(j.error || '')}</div>`; return; }
             const r = j.result;
             if (j.kind === 'export_csv') {
+              if (r.refreshed) loadSeason(S.season);      // CSV を読み直したので、一覧も新しくする
               out.innerHTML = resultHtml('更新後の CSV を書き出しました', r.path,
+                (r.refreshed ? '<div>CSV が走査のあとに変わっていたため、CSV を読み直してから書き出しました。</div>' : '') +
                 `<div>追加 ${nf(r.added)} 行、削除 ${nf(r.removed)} 行、拡張子の更新 ${nf(r.ext_updated)} 行</div>` +
                 (r.mark_items ? `<div>${esc(r.mark_col)} 列に「${esc(r.mark_text)}」と書いた行 ${nf(r.marked)} 行` +
                   (r.mark_kept ? `（すでに入っていた ${nf(r.mark_kept)} 行はそのまま）` : '') + '</div>' : '') +

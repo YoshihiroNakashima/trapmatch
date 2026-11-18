@@ -5,7 +5,9 @@ import json
 import ntpath
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import threading
 import time
 import unicodedata
@@ -16,7 +18,7 @@ from datetime import datetime
 import tm_csv
 import tm_media
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 
 # 状態のビット
 F_MISSING = 1    # 欠け（一部の保存場所にしかない）
@@ -66,6 +68,8 @@ DEFAULT_SETTINGS = {
     # Season 名を、先頭の英字 1 文字と数字 6 桁（N250102 など）だけで照合する。
     # N250102_P01 と N250102_P02 のようなフォルダは、どちらも N250102 としてまとめて扱う。
     'season_prefix': True,
+    # 「CSV に行を追加する」で、動画があることを確かめる保存場所。auto は、名前に NAS を含む保存場所
+    'csv_add_source': 'auto',
     'ext_ref': 'auto',       # CSV の拡張子をそろえる基準の保存場所（'auto' は優先順）
     'ffmpeg': '',
 }
@@ -262,6 +266,8 @@ class Store(object):
             if 'add_defaults' in st else dict(ADD_ROW_DEFAULTS)
         if isinstance(st.get('season_prefix'), bool):
             o['season_prefix'] = st['season_prefix']
+        if st.get('csv_add_source') in [x['id'] for x in out['sources'] if x['type'] == 'folder']:
+            o['csv_add_source'] = st['csv_add_source']
         if isinstance(st.get('mark_text'), str):
             t = st['mark_text'].strip()
             if len(t) <= 100 and not any(c in t for c in '\r\n\x00'):
@@ -344,6 +350,31 @@ class Store(object):
         d = os.path.join(self.data_dir, 'exports', safe_name(season))
         os.makedirs(d, exist_ok=True)
         return d
+
+    def backup_dir(self):
+        return os.path.join(self.data_dir, 'backups')
+
+    def operations_path(self):
+        return os.path.join(self.data_dir, 'logs', 'operations.jsonl')
+
+    def log_operation(self, entry):
+        """保存場所や CSV を変更した操作を、1 行に 1 件の JSON で記録する。"""
+        with self.lock:
+            with open(self.operations_path(), 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    def operations(self):
+        out = []
+        try:
+            with open(self.operations_path(), encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+        return out
 
 
 SCHEMA = """
@@ -579,28 +610,66 @@ def csv_exts(cj):
     return {cj['ext'].lower(): cj.get('n', 1)} if cj.get('ext') else {}
 
 
-def run_scan(store, season, job):
+def current_sources(cfg, season):
+    """いまの設定で照合に使う保存場所（フォルダ型すべてと、CSV は最初の 1 つ）。"""
+    sources = [s for s in cfg['sources'] if s.get('enabled', True) and s.get('path')]
+    folders = [s for s in sources if s['type'] == 'folder']
+    csvs = [dict(s, path=season_path(s['path'], season)) for s in sources if s['type'] == 'csv'][:1]
+    return folders, csvs
+
+
+def sources_changed(cfg, meta):
+    """走査のあとに、保存場所の登録（どれを使うか、その場所）が変わったか。"""
+    folders, csvs = current_sources(cfg, meta['season'])
+    now = [(s['id'], s['type'], s['path']) for s in folders + csvs]
+    then = [(s['id'], s['type'], s['path']) for s in meta['sources']]
+    return now != then
+
+
+def run_scan(store, season, job, csv_only=False):
+    """保存場所を読んで照合し、作業状態に保存する。
+
+    csv_only のときは、フォルダは読まずに前回の走査の結果を使い、CSV だけを読み直す
+    （CSV に行を書き足したあとなど）。照合の決まりと保存場所は、前回の走査のときのものを使う。
+    """
     cfg = store.config()
     settings = cfg['settings']
-    by_prefix = bool(settings.get('season_prefix', True))
-    season = season_key(season, by_prefix)
+    prev_meta = prev_items = None
+    if csv_only:
+        con = store.connect(season)
+        try:
+            prev_meta = get_meta(con)
+            prev_items = con.execute('SELECT key, station, stem, files FROM items ORDER BY ord').fetchall()
+        finally:
+            con.close()
+        by_prefix = bool(prev_meta.get('season_prefix', False))
+        season = prev_meta['season']
+    else:
+        by_prefix = bool(settings.get('season_prefix', True))
+        season = season_key(season, by_prefix)
     if not season:
         raise ValueError('Season を指定してください')
-    season_cf = season.casefold()
+    season_cf = season_key(season, by_prefix).casefold()
 
     def is_season(value):
         return season_key(value, by_prefix).casefold() == season_cf
 
-    exts = set(settings['exts'])
-    ignore_ext = bool(settings['ignore_ext'])
-    sources = [s for s in cfg['sources'] if s.get('enabled', True) and s.get('path')]
-    folders = [s for s in sources if s['type'] == 'folder']
-    csvs = [dict(s, path=season_path(s['path'], season)) for s in sources if s['type'] == 'csv'][:1]
+    if csv_only:
+        exts = set(prev_meta['exts'])
+        ignore_ext = bool(prev_meta['ignore_ext'])
+        folders = [s for s in prev_meta['sources'] if s['type'] == 'folder']
+        csvs = [s for s in prev_meta['sources'] if s['type'] == 'csv']
+        if not csvs:
+            raise ValueError('CSV が保存場所に登録されていません')
+    else:
+        exts = set(settings['exts'])
+        ignore_ext = bool(settings['ignore_ext'])
+        folders, csvs = current_sources(cfg, season)
     used = folders + csvs
     if len(used) < 2:
         raise ValueError('照合には保存場所が 2 つ以上必要です。設定で保存場所を登録してください。')
     for s in folders:
-        if not os.path.isdir(s['path']):
+        if not csv_only and not os.path.isdir(s['path']):
             raise ValueError('保存場所「%s」のフォルダが見つかりません: %s\n'
                              '接続を確かめるか、設定で「使う」を外してください。' % (s['name'], s['path']))
     for s in csvs:
@@ -615,9 +684,14 @@ def run_scan(store, season, job):
     info = {'missing_season': [], 'nontarget': {}, 'exceptions': [], 'files': {}, 'stations': {},
             'season_dirs': {}, 'station_dirs': {}, 'station_multi': {}}
     tasks = []
-    job.update(phase='フォルダの一覧を取得中', done=0, total=0)
+    if csv_only:
+        # フォルダの情報は、前回の走査の記録をそのまま使う
+        info = json.loads(json.dumps(prev_meta.get('info') or info))
+        info.setdefault('files', {})
+    else:
+        job.update(phase='フォルダの一覧を取得中', done=0, total=0)
     spelling = None
-    for s in folders:
+    for s in ([] if csv_only else folders):
         info['nontarget'][s['id']] = 0
         info['files'][s['id']] = 0
         info['stations'][s['id']] = 0
@@ -660,7 +734,19 @@ def run_scan(store, season, job):
             items[key] = it
         return it
 
-    job.update(phase='動画の一覧を取得中', done=0, total=len(tasks))
+    if csv_only:
+        # 動画がある動画だけを前回の記録から作る。CSV にしかなかった動画は、CSV を読み直して作り直す
+        for key, station, stem, files_json in prev_items:
+            fl = json.loads(files_json)
+            if not any(fl.values()):
+                continue
+            it = get_item(key, station, stem)
+            it['files'] = fl
+            for sid, v in fl.items():
+                if v and sid in bit:
+                    it['mask'] |= 1 << bit[sid]
+    else:
+        job.update(phase='動画の一覧を取得中', done=0, total=len(tasks))
 
     def work(t):
         try:
@@ -708,7 +794,7 @@ def run_scan(store, season, job):
         dt_samples = []
         station_names = {}
         b = bit[s['id']]
-        if data['rows'] and info['missing_season'] == [x['id'] for x in folders]:
+        if not csv_only and data['rows'] and info['missing_season'] == [x['id'] for x in folders]:
             # どのフォルダにもこの Season がないときは、CSV に書かれた綴りを使う
             season = season_key(data['rows'][0][data['i_season']], by_prefix) or season
         # Season 列の綴りと、Season フォルダの名前の列（Season_sub_folder）
@@ -782,7 +868,7 @@ def run_scan(store, season, job):
                          'Season 名を確かめてください。' % season)
     job.update(phase='作業状態を保存中', done=0, total=len(ordered))
     inherit, inherited_from = ({}, [])
-    if by_prefix and not store.has_project(season):
+    if by_prefix and not csv_only and not store.has_project(season):
         inherit, inherited_from = earlier_decisions(store, season_cf, by_prefix)
     con = store.connect(season, create=True)
     try:
@@ -830,12 +916,16 @@ def run_scan(store, season, job):
                 con.execute('INSERT OR REPLACE INTO gone(key, station, stem, decision, memo, pick,'
                             ' csv_fields, decided_at, gone_at) VALUES(?,?,?,?,?,?,?,?,?)',
                             (key, o[10], o[11], o[1], o[2], o[3], o[4], o[8], now_text()))
-        set_meta(con, season=season, scanned_at=now_text(), version=VERSION, next_id=next_id,
-                 sources=[{'id': s['id'], 'name': s['name'], 'type': s['type'], 'path': s['path'],
-                           'readonly': s.get('readonly', False)} for s in used],
-                 ignore_ext=ignore_ext, exts=sorted(exts), info=info, csv=csv_meta,
-                 season_prefix=by_prefix)
-        set_meta(con, inherited_from=inherited_from)      # 引き継ぎの知らせは、次に走査するまで出す
+        if csv_only:
+            # 走査の日時や照合の決まりは変えない。CSV を読み直した日時だけを記録する
+            set_meta(con, next_id=next_id, info=info, csv=csv_meta, csv_read_at=now_text())
+        else:
+            set_meta(con, season=season, scanned_at=now_text(), version=VERSION, next_id=next_id,
+                     sources=[{'id': s['id'], 'name': s['name'], 'type': s['type'], 'path': s['path'],
+                               'readonly': s.get('readonly', False)} for s in used],
+                     ignore_ext=ignore_ext, exts=sorted(exts), info=info, csv=csv_meta,
+                     season_prefix=by_prefix, csv_read_at='')
+            set_meta(con, inherited_from=inherited_from)      # 引き継ぎの知らせは、次に走査するまで出す
         con.commit()
     finally:
         con.close()
@@ -1035,28 +1125,39 @@ def resolve_file(store, season, item_id, src_id, n=0):
     raise KeyError('ファイルが見つかりません')
 
 
-def ensure_embedded(con, meta, it):
-    """埋め込みの撮影日時を読んで保存する。読んだあとの it を返す。"""
+def ensure_embedded(con, meta, it, offline=()):
+    """埋め込みの撮影日時を読んで保存する。読んだあとの it を返す。
+
+    offline は、つながっていない保存場所の id。そこのファイルは読みに行かず、読めなかったものとして扱う。
+    読めなかったファイルがあっても、同じ拡張子で同じサイズのファイル（同じ内容の控え）を別の保存場所で
+    読めていれば、その結果で決める。HDD を外していても、NAS に同じ動画があれば調べられる。
+    """
     it['dt_unreadable'] = False
     if it['dt_emb'] is not None:
         return it
     found = None
-    unreadable = False
+    unread = []
+    read_ok = set()
     for s in meta['sources']:
         if s['type'] != 'folder':
             continue
         for f in it['files'].get(s['id']) or []:
+            same = (ext_of(f[0]).lower(), f[1])
+            if s['id'] in offline:
+                unread.append(same)
+                continue
             try:
                 dt, kind = tm_media.embedded_datetime(file_path(s, meta['season'], f))
             except OSError:
-                unreadable = True       # 読めなかった（接続が切れているなど）。「日時なし」とは区別する
+                unread.append(same)     # 読めなかった（接続が切れているなど）。「日時なし」とは区別する
                 continue
+            read_ok.add(same)
             if dt is not None:
                 found = (dt.strftime('%Y-%m-%d %H:%M:%S'), kind, '%s: %s' % (s['name'], f[0]))
                 break
         if found:
             break
-    if found is None and unreadable:
+    if found is None and any(u not in read_ok for u in unread):
         it['dt_unreadable'] = True      # 記録しない。次に読めたときに改めて調べる
         return it
     if found is None:
@@ -1116,7 +1217,8 @@ def dt_profile(con, meta):
     if not csv_meta or csv_meta.get('i_dt', -1) < 0:
         return None
     cached = meta.get('dt_profile')
-    if cached and cached.get('scanned_at') == meta.get('scanned_at') and cached.get('v') == 1:
+    if cached and cached.get('scanned_at') == meta.get('scanned_at') and cached.get('v') == 1 \
+            and (cached.get('csv_read_at') or '') == (meta.get('csv_read_at') or ''):
         return cached
     used = meta['sources']
     n = sec0 = unparsed = 0
@@ -1155,7 +1257,8 @@ def dt_profile(con, meta):
             near += 1
         else:
             differ += 1
-    prof = {'v': 1, 'scanned_at': meta.get('scanned_at'), 'n_dt': n, 'sec0': sec0, 'unparsed': unparsed,
+    prof = {'v': 1, 'scanned_at': meta.get('scanned_at'), 'csv_read_at': meta.get('csv_read_at') or '',
+            'n_dt': n, 'sec0': sec0, 'unparsed': unparsed,
             'minute_only': bool(minute_only),
             'mtime': {'n': len(pairs), 'match': match, 'near': near, 'differ': differ, 'disagree': disagree}}
     set_meta(con, dt_profile=prof)
@@ -1593,13 +1696,13 @@ def season_matcher(meta):
     return lambda value: season_key(value, by_prefix).casefold() == cf
 
 
-def _check_csv_unchanged(csv_meta):
+def csv_changed(csv_meta):
+    """CSV が、最後に読み込んだあとに変わっているか（大きさか更新日時が違う）。見つからなければ ValueError。"""
     p = csv_meta['path']
     if not os.path.isfile(p):
         raise ValueError('CSV が見つかりません: %s' % p)
     st = os.stat(p)
-    if st.st_size != csv_meta['size'] or int(st.st_mtime) != csv_meta['mtime']:
-        raise ValueError('CSV が走査のあとに変更されています。再走査してから書き出してください。')
+    return st.st_size != csv_meta['size'] or int(st.st_mtime) != csv_meta['mtime']
 
 
 def csv_change_counts(store, season):
@@ -1646,6 +1749,39 @@ def csv_change_counts(store, season):
                              sorted(add_row_defaults(meta['csv'], cfg['settings'], meta['season']).items())]}
 
 
+def added_row(it, meta, settings, cols, minute_only):
+    """CSV に足す 1 行（列の値のリスト）と、DateTime の由来を返す。
+
+    it は、埋め込みの撮影日時を読み終えたもの（ensure_embedded のあと）。cols は {見出しの小文字: 列番号}。
+    由来は fill_datetime と同じ。DateTime 列がないか、行ごとに入力された値を使ったときは None。
+    """
+    csv_meta = meta['csv']
+    used = meta['sources']
+    ext_ref = settings.get('ext_ref', 'auto')
+    fields = [''] * len(csv_meta['header'])
+    defaults = add_row_defaults(csv_meta, settings, meta['season'],
+                                season_folder_for(it, used, csv_meta, meta['season'], ext_ref))
+    for i, val in defaults.items():
+        fields[i] = val
+    # 行ごとに入力された値は、既定値より優先する
+    for name, val in (it['csv_fields'] or {}).items():
+        i = cols.get(name.strip().casefold())
+        if i is not None and i not in (csv_meta['i_season'], csv_meta['i_station'], csv_meta['i_file']):
+            fields[i] = val
+    # Season 列は、CSV の既存の行と同じ綴りにする。行によって綴りが違うときは、同じ Station の行の綴り、
+    # それも決まらなければ Season 名
+    fields[csv_meta['i_season']] = ((csv_meta.get('station_season') or {}).get(it['station'].casefold())
+                                    or csv_meta.get('season_name') or meta['season'])
+    # Station は、CSV にすでにある綴りがあればそれに合わせる
+    fields[csv_meta['i_station']] = (csv_meta.get('station_names') or {}).get(it['station'].casefold(), it['station'])
+    fields[csv_meta['i_file']] = ref_file(it['files'], used, ext_ref, it['pick'])[1][0]
+    origin = None
+    if csv_meta['i_dt'] >= 0 and not fields[csv_meta['i_dt']]:
+        text, origin = fill_datetime(it, used, settings, csv_meta['dtfmt'], minute_only)
+        fields[csv_meta['i_dt']] = text
+    return fields, origin
+
+
 def export_csv(store, season, opts, job):
     """行の追加、行の削除、拡張子の更新を反映した CSV を、別名で書き出す。
 
@@ -1660,11 +1796,20 @@ def export_csv(store, season, opts, job):
     do_mark = bool(opts.get('mark', True))
     con = store.connect(season)
     try:
+        csv_meta = get_meta(con).get('csv')
+    finally:
+        con.close()
+    if not csv_meta:
+        raise ValueError('CSV が保存場所に登録されていません')
+    # CSV が走査のあとに変わっていれば（ほかの Season の行を書き足したあとなど）、CSV だけを読み直してから書き出す。
+    # 0.2.0 以前の走査結果（Station ごとの Season_sub_folder の記録がない）も、読み直してから書き出す
+    refreshed = csv_changed(csv_meta) or 'station_sub' not in csv_meta
+    if refreshed:
+        run_scan(store, season, job, csv_only=True)
+    con = store.connect(season)
+    try:
         meta = get_meta(con)
-        csv_meta = meta.get('csv')
-        if not csv_meta:
-            raise ValueError('CSV が保存場所に登録されていません')
-        _check_csv_unchanged(csv_meta)
+        csv_meta = meta['csv']
         used = meta['sources']
         exts = set(meta['exts'])
         ignore_ext = meta['ignore_ext']
@@ -1694,11 +1839,6 @@ def export_csv(store, season, opts, job):
         n_na = n_unreadable = n_emb = n_mtime = 0
         prof = dt_profile(con, meta)
         minute_only = bool(prof and prof['minute_only'])
-        station_names = csv_meta.get('station_names') or {}
-        # Season 列は、CSV の既存の行と同じ綴りにする。行によって綴りが違うときは、同じ Station の行の綴り、
-        # それも決まらなければ Season 名
-        season_text = csv_meta.get('season_name') or meta['season']
-        station_season = csv_meta.get('station_season') or {}
         for n, it in enumerate(to_add, 1):
             ensure_embedded(con, meta, it)
             if it.get('dt_unreadable'):
@@ -1706,29 +1846,13 @@ def export_csv(store, season, opts, job):
             if n % 50 == 0:
                 con.commit()
                 job.update(done=n)
-            fields = [''] * len(header)
-            defaults = add_row_defaults(csv_meta, settings, meta['season'],
-                                        season_folder_for(it, used, csv_meta, meta['season'], ext_ref))
-            for i, val in defaults.items():
-                fields[i] = val
-            # 行ごとに入力された値は、既定値より優先する
-            for name, val in (it['csv_fields'] or {}).items():
-                i = cols.get(name.strip().casefold())
-                if i is not None and i not in (csv_meta['i_season'], csv_meta['i_station'], csv_meta['i_file']):
-                    fields[i] = val
-            fields[csv_meta['i_season']] = station_season.get(it['station'].casefold()) or season_text
-            # Station は、CSV にすでにある綴りがあればそれに合わせる
-            fields[csv_meta['i_station']] = station_names.get(it['station'].casefold(), it['station'])
-            fields[csv_meta['i_file']] = ref_file(it['files'], used, ext_ref, it['pick'])[1][0]
-            if csv_meta['i_dt'] >= 0 and not fields[csv_meta['i_dt']]:
-                text, origin = fill_datetime(it, used, settings, fmt, minute_only)
-                if origin == 'embedded':
-                    n_emb += 1
-                elif origin == 'mtime':
-                    n_mtime += 1
-                else:
-                    n_na += 1
-                fields[csv_meta['i_dt']] = text
+            fields, origin = added_row(it, meta, settings, cols, minute_only)
+            if origin == 'embedded':
+                n_emb += 1
+            elif origin == 'mtime':
+                n_mtime += 1
+            elif origin is not None:
+                n_na += 1
             add_rows.append(fields)
         con.commit()
     finally:
@@ -1762,7 +1886,269 @@ def export_csv(store, season, opts, job):
                 'added_na': n_na, 'added_unreadable': n_unreadable, 'added_embedded': n_emb,
                 'added_mtime': n_mtime, 'minute_only': minute_only, 'source': csv_meta['path'],
                 'mark_col': header[i_mark] if i_mark >= 0 else '', 'mark_text': settings.get('mark_text', ''),
-                'mark_items': len(mark_keys)})
+                'mark_items': len(mark_keys), 'refreshed': refreshed})
+    return res
+
+
+# ---------------------------------------------------------------- CSV に行を書き足す（実行）
+
+def add_basis_sources(used, settings):
+    """「CSV に行を追加する」で、動画があることを確かめる保存場所（フォルダ型）。
+
+    設定が auto のときは、名前に NAS を含む保存場所すべて（どれか 1 つに動画があればよい）。
+    保存場所を選んであれば、その 1 つ。該当がなければ空のリスト。
+    """
+    folders = [s for s in used if s['type'] == 'folder']
+    want = settings.get('csv_add_source', 'auto')
+    if want and want != 'auto':
+        return [s for s in folders if s['id'] == want]
+    return [s for s in folders if 'nas' in s['name'].casefold()]
+
+
+def csv_add_counts(store, season):
+    """「CSV に行を追加する」の対象の本数（実行の前の確認用）。保存場所も CSV も読まない。"""
+    cfg = store.config()
+    con = store.connect(season)
+    try:
+        meta = get_meta(con)
+        csv_meta = meta.get('csv')
+        if not csv_meta:
+            raise ValueError('CSV が保存場所に登録されていません')
+        used = meta['sources']
+        basis = add_basis_sources(used, cfg['settings'])
+        ids = [s['id'] for s in basis]
+        target = elsewhere = 0
+        for (files_json,) in con.execute("SELECT files FROM items WHERE decision='keep' AND csv=''"):
+            files = json.loads(files_json)
+            if any(files.get(i) for i in ids):
+                target += 1
+            elif any(files.values()):
+                elsewhere += 1
+    finally:
+        con.close()
+    p = csv_meta['path']
+    exists = os.path.isfile(p)
+    changed = exists and csv_changed(csv_meta)
+    return {
+        # target: 書き足す対象（残す、基準の保存場所にある、CSV にない）
+        # elsewhere: 残すと判断した CSV にない動画のうち、基準の保存場所にないもの（対象外）
+        'target': target, 'elsewhere': elsewhere,
+        'basis': [{'id': s['id'], 'name': s['name']} for s in basis],
+        'choice': cfg['settings'].get('csv_add_source', 'auto'),
+        'folders': [{'id': s['id'], 'name': s['name']} for s in used if s['type'] == 'folder'],
+        'path': p, 'exists': exists, 'changed': changed, 'sources_changed': sources_changed(cfg, meta),
+        'has_dt': csv_meta['i_dt'] >= 0, 'dt_source': cfg['settings'].get('dt_source', 'embedded'),
+        'backup_dir': store.backup_dir(),
+    }
+
+
+def _still_there(it, basis, offline, season):
+    """基準の保存場所に、走査のときと同じサイズのファイルがいまもあるか。"""
+    for s in basis:
+        if s['id'] in offline:
+            continue
+        for f in it['files'].get(s['id']) or []:
+            try:
+                st = os.stat(file_path(s, season, f))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_size == f[1]:
+                return True
+    return False
+
+
+def backup_csv(store, path, st):
+    """CSV を書き換える前の控えを作る。(控えのパス, 新しく作ったか) を返す。
+
+    控えは 1 日に 1 つ。その日の控えがすでにあり、そのあと CSV を変えたのが TrapMatch の書き足しだけなら、
+    新しくは作らない（書き足した行は操作の記録に残っていて、控えからの差が分かるため）。
+    それ以外（その日の最初の書き足し、ほかのプログラムが CSV を変えたあと）は、全体を写す。
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    same = os.path.normcase(os.path.abspath(path))
+    last = None
+    for e in store.operations():
+        if e.get('op') == 'csv_add' and os.path.normcase(os.path.abspath(e.get('csv', ''))) == same:
+            last = e
+    if last and (last.get('new_size'), last.get('new_mtime')) == (st.st_size, int(st.st_mtime)) \
+            and last.get('backup_day') == today and last.get('backup') and os.path.isfile(last['backup']):
+        return last['backup'], False
+    d = store.backup_dir()
+    os.makedirs(d, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(path))
+    name = '%s_%s' % (base, stamp())
+    dst = os.path.join(d, name + (ext or '.csv'))
+    n = 1
+    while os.path.exists(dst):          # すでにある控えには上書きしない
+        n += 1
+        dst = os.path.join(d, '%s_%d%s' % (name, n, ext or '.csv'))
+    part = dst + '.part'
+    try:
+        shutil.copyfile(path, part)
+        if os.path.getsize(part) != st.st_size:
+            raise OSError('控えの大きさが元の CSV と違います')
+        os.replace(part, dst)
+    except OSError as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise ValueError('CSV の控えを作れませんでした（%s）。CSV は変更していません。' % (e.strerror or e))
+    return dst, True
+
+
+def csv_add_rows(store, season, opts, job):
+    """「残す」と判断した動画のうち、基準の保存場所（NAS）にあって CSV にないものの行を、元の CSV に書き足す。
+
+    行は CSV の末尾に足し、すでにある内容は書き換えない。書く前に控えを作り、書いたあとに CSV を読み直して、
+    足した行が動画の行として読めることを確かめる。次の動画は足さずに件数を返す。
+    - 基準の保存場所に、走査のときと同じサイズのファイルが見つからない動画
+    - 撮影日時が必要なのに、動画を読めなかった動画
+    """
+    cfg = store.config()
+    settings = cfg['settings']
+    con = store.connect(season)
+    try:
+        meta = get_meta(con)
+    finally:
+        con.close()
+    csv_meta = meta.get('csv')
+    if not csv_meta:
+        raise ValueError('CSV が保存場所に登録されていません')
+    if sources_changed(cfg, meta):
+        raise ValueError('保存場所の登録が、走査のあとに変わっています。「走査」をやり直してから実行してください。')
+    used = meta['sources']
+    basis = add_basis_sources(used, settings)
+    if not basis:
+        raise ValueError('動画があることを確かめる保存場所が決まっていません。'
+                         '名前に NAS を含む保存場所がないので、保存場所を選んでください。')
+    path = csv_meta['path']
+    if not os.path.isfile(path):
+        raise ValueError('CSV が見つかりません: %s' % path)
+    offline = set(s['id'] for s in used if s['type'] == 'folder' and not os.path.isdir(s['path']))
+    if all(s['id'] in offline for s in basis):
+        raise ValueError('保存場所「%s」に接続できません（%s）。接続を確かめてください。'
+                         % ('、'.join(s['name'] for s in basis), '、'.join(s['path'] for s in basis)))
+
+    # 1. CSV が走査のあとに変わっていれば、読み直してから対象を決める。
+    #    0.2.0 以前の走査結果には、Station ごとの Season_sub_folder の記録がないので、そのときも読み直す
+    refreshed = csv_changed(csv_meta) or 'station_sub' not in csv_meta
+    if refreshed:
+        run_scan(store, season, job, csv_only=True)
+
+    # 2. 対象の動画を確かめ、足す行を作る
+    con = store.connect(season)
+    try:
+        meta = get_meta(con)
+        csv_meta = meta['csv']
+        header = csv_meta['header']
+        cols = {h.strip().casefold(): i for i, h in reversed(list(enumerate(header)))}
+        i_dt = csv_meta['i_dt']
+        targets = []
+        elsewhere = 0
+        for it in _iter_items(con):
+            if it['decision'] != 'keep' or it['csv']:
+                continue
+            if any(it['files'].get(s['id']) for s in basis):
+                targets.append(it)
+            elif any(it['files'].values()):
+                elsewhere += 1
+        prof = dt_profile(con, meta)
+        minute_only = bool(prof and prof['minute_only'])
+        job.update(phase='動画を確かめ中', done=0, total=len(targets))
+        rows = []
+        added = []
+        n_changed = n_unreadable = n_emb = n_mtime = n_na = 0
+        for n, it in enumerate(targets, 1):
+            if n % 20 == 0:
+                con.commit()
+                job.update(done=n)
+            if not _still_there(it, basis, offline, meta['season']):
+                n_changed += 1
+                continue
+            typed = any(cols.get(k.strip().casefold()) == i_dt and v for k, v in (it['csv_fields'] or {}).items())
+            if i_dt >= 0 and not typed:
+                ensure_embedded(con, meta, it, offline)
+                if it.get('dt_unreadable'):
+                    n_unreadable += 1
+                    continue
+            fields, origin = added_row(it, meta, settings, cols, minute_only)
+            if origin == 'embedded':
+                n_emb += 1
+            elif origin == 'mtime':
+                n_mtime += 1
+            elif origin is not None:
+                n_na += 1
+            rows.append(fields)
+            added.append((it['key'], it['station'], it['stem']))
+        con.commit()
+    finally:
+        con.close()
+
+    res = {
+        'added': 0, 'path': path, 'targets': len(targets), 'elsewhere': elsewhere,
+        'changed': n_changed, 'unreadable': n_unreadable,
+        'added_embedded': n_emb, 'added_mtime': n_mtime, 'added_na': n_na, 'minute_only': minute_only,
+        'basis': [s['name'] for s in basis], 'refreshed': refreshed,
+        'offline': [s['name'] for s in used if s['id'] in offline],
+        'backup': '', 'backup_new': False, 'record': '', 'verified': 0, 'unverified': [], 'refresh_error': '',
+    }
+    if not rows:
+        return res
+
+    # 3. 書ける内容かを先に確かめ、控えを作ってから書き足す
+    try:
+        tm_csv.rows_text(csv_meta, rows).encode(tm_csv.text_encoding(csv_meta['encoding']))
+    except UnicodeEncodeError as e:
+        raise ValueError('追加する行に、CSV の文字コード（%s）で表せない文字があります: %r'
+                         % (csv_meta['encoding'], e.object[e.start:e.end]))
+    changed_msg = 'CSV が、読み込んだあとにほかのプログラムで変更されました。CSV は変更していません。もう一度実行してください。'
+    if csv_changed(csv_meta):
+        raise ValueError(changed_msg)
+    job.update(phase='CSV の控えを作成中', done=0, total=0)
+    backup, backup_new = backup_csv(store, path, os.stat(path))
+    job.update(phase='CSV に書き足し中', done=0, total=0)
+    try:
+        w = tm_csv.append_rows(path, csv_meta, rows, (csv_meta['size'], csv_meta['mtime']))
+    except tm_csv.CsvChanged:
+        raise ValueError(changed_msg)
+    except tm_csv.AppendFailed as e:
+        raise ValueError('CSV に書き足せませんでした（%s）。%s' % (e, (
+            'CSV は書き足す前の状態です。ほかのアプリで CSV を開いていないか確かめてください。' if e.restored else
+            'CSV の末尾に書きかけの行が残っている可能性があります。末尾を確かめてください（控え: %s）。' % backup)))
+    res.update({'added': w['added'], 'old_size': w['old_size'], 'new_size': w['new_size'],
+                'backup': backup, 'backup_new': backup_new})
+
+    # 4. 操作の記録と、足した行の控え。ここから先で失敗しても、CSV への書き足しは済んでいる
+    entry = {'at': now_text(), 'op': 'csv_add', 'version': VERSION, 'season': meta['season'], 'csv': path,
+             'old_size': w['old_size'], 'old_mtime': csv_meta['mtime'],
+             'new_size': w['new_size'], 'new_mtime': w['new_mtime'], 'rows': w['added'],
+             'backup': backup, 'backup_day': datetime.now().strftime('%Y-%m-%d'), 'record': ''}
+    try:
+        base = os.path.splitext(os.path.basename(path))[0]
+        record = os.path.join(store.export_dir(meta['season']), '%s_added_%s.csv' % (base, stamp()))
+        with open(record, 'w', encoding=csv_meta['encoding'], newline='') as f:
+            f.write(tm_csv.rows_text(csv_meta, [header] + rows))
+        res['record'] = entry['record'] = record
+    except (OSError, UnicodeError) as e:
+        res['record_error'] = '%s' % e
+    try:
+        store.log_operation(entry)
+    except OSError as e:
+        res['log_error'] = '%s' % e
+
+    # 5. CSV を読み直して、足した行が動画の行として読めることを確かめる
+    try:
+        run_scan(store, season, job, csv_only=True)
+        con = store.connect(season)
+        try:
+            have = set(r[0] for r in con.execute("SELECT key FROM items WHERE csv != ''"))
+        finally:
+            con.close()
+        res['verified'] = sum(1 for k, _s, _f in added if k in have)
+        res['unverified'] = ['%s / %s' % (s, f) for k, s, f in added if k not in have][:10]
+    except Exception as e:  # noqa: BLE001  書き足しは済んでいるので、結果は返す
+        res['refresh_error'] = '%s' % e
     return res
 
 

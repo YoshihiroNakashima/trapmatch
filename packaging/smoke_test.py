@@ -144,6 +144,16 @@ def main():
         job = wait_job(port)
         check(st == 200 and job['state'] == 'done' and os.path.isfile(job['result']['path']) and job['result']['rows'] >= n_mis,
               '全 Season をまとめて書き出せる')
+        # 元の CSV に行を書き足す（残すと判断した、NAS にあって CSV にない動画）
+        csv_before = open(tree['csv'], 'rb').read()
+        st, r = post_json(port, '/api/export', {'season': S, 'kind': 'csv_add', 'confirm': True})
+        job = wait_job(port)
+        res = job.get('result') or {}
+        csv_after = open(tree['csv'], 'rb').read()
+        check(st == 200 and job['state'] == 'done' and res.get('added') == 1 and res.get('verified') == 1
+              and csv_after.startswith(csv_before) and b',BSN0001,IMG_0008.MP4,' in csv_after[len(csv_before):]
+              and open(res['backup'], 'rb').read() == csv_before,
+              '元の CSV に行を書き足せる（%s）' % (job.get('error') or res.get('added')))
         # 同じ版をもう一度起動しても、二重には動かない
         again = subprocess.run([exe] + args, env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, timeout=120)

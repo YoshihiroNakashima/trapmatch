@@ -357,3 +357,37 @@ def test_export_all_seasons(server):
 def r_mismatch(c, season):
     st, p = c.get('/api/items?season=' + season)
     return sum(1 for a in p['items'] if a[4] & 0x4f)
+
+
+def test_csv_add_needs_confirmation_and_appends_rows(server):
+    """元の CSV への行の追加は、確認を付けた要求だけを受け付ける。"""
+    c, tree = server
+    S = fixture.SEASON
+    c.post('/api/scan', {'season': S})
+    assert c.wait_job()['state'] == 'done'
+    items, p = ids(c)
+    i14 = items[('BSN0001', 'IMG_0014')][0]           # HDD と NAS にあって、CSV にない
+    assert items[('BSN0001', 'IMG_0014')][3] == 3
+    st, r = c.post('/api/decide', {'season': S, 'ids': [i14], 'decision': 'keep'})
+    assert st == 200
+    st, cnt = c.post('/api/export', {'season': S, 'kind': 'csv_add_counts'})
+    assert st == 200 and [b['name'] for b in cnt['basis']] == ['NAS'] and cnt['target'] >= 1 and cnt['path'] == tree['csv']
+    before = open(tree['csv'], 'rb').read()
+    for body in ({'season': S, 'kind': 'csv_add'}, {'season': S, 'kind': 'csv_add', 'confirm': 'yes'}):
+        st, r = c.post('/api/export', body)
+        assert st == 400 and open(tree['csv'], 'rb').read() == before
+    st, r = c.post('/api/export', {'season': S, 'kind': 'csv_add', 'confirm': True})
+    assert st == 200 and r['job']['kind'] == 'csv_add'
+    job = c.wait_job()
+    assert job['state'] == 'done', job
+    res = job['result']
+    assert res['added'] == cnt['target'] and res['verified'] == res['added'] and res['backup_new']
+    after = open(tree['csv'], 'rb').read()
+    assert after.startswith(before) and len(after) == res['new_size']
+    tail = after[len(before):].decode('utf-8')
+    assert tail.count('\r\n') == res['added'] and '%s,BSN0001,IMG_0014.AVI,2026/01/05 06:07:08,' % S in tail
+    assert open(res['backup'], 'rb').read() == before
+    items, p = ids(c)
+    assert items[('BSN0001', 'IMG_0014')][3] == 7 and items[('BSN0001', 'IMG_0014')][0] == i14
+    st, cnt = c.post('/api/export', {'season': S, 'kind': 'csv_add_counts'})
+    assert cnt['target'] == 0 and not cnt['changed']

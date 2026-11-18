@@ -2,7 +2,8 @@
 """TrapMatch: カメラトラップ動画の保存場所間照合アプリ（第 1 版）。
 
 PC の中だけで動く小さなサーバーを立て、ブラウザの画面から操作する。
-この版は保存場所のファイルを一切変更しない（読み取りと、別フォルダへの書き出しのみ）。
+動画のファイルは一切変更しない。元の CSV に書くのは、確認のうえで行を末尾に足すときだけ（tm_core.csv_add_rows）。
+それ以外は、読み取りと別フォルダへの書き出しのみ。
 
 使い方:  python app.py [--port 8770] [--data-dir フォルダ] [--no-browser]
 exe にまとめた版（TrapMatch.exe）も、同じ引数を受け取る。
@@ -492,11 +493,15 @@ def p_scan(h, q):
 
 
 def _not_while_scanning(season):
-    """走査の最後に作業状態を書き直すので、その Season の走査中は変更を受け付けない。"""
+    """走査の最後に作業状態を書き直すので、その Season の走査中は変更を受け付けない。
+
+    CSV への書き足し（csv_add）も、CSV を読み直して作業状態を書き直すので同じ扱いにする。
+    """
     job = APP.jobs.current()
-    if job is not None and job.state == 'running' and job.kind == 'scan' \
+    if job is not None and job.state == 'running' and job.kind in ('scan', 'csv_add') \
             and job.season.casefold() == season.casefold():
-        raise HttpError(409, '走査が終わるまで、判断とメモは変更できません')
+        raise HttpError(409, '走査が終わるまで、判断とメモは変更できません' if job.kind == 'scan'
+                        else 'CSV への書き足しが終わるまで、判断とメモは変更できません')
 
 
 def p_decide(h, q):
@@ -560,6 +565,15 @@ def p_export(h, q):
         h.send_json({'job': job.as_dict()})
     elif kind == 'dtcheck':
         job = APP.jobs.start('dtcheck', season, lambda job: tm_core.dt_check(APP.store, season, job))
+        h.send_json({'job': job.as_dict()})
+    elif kind == 'csv_add_counts':
+        h.send_json(tm_core.csv_add_counts(APP.store, season))
+    elif kind == 'csv_add':
+        # 元の CSV に書き足す。画面で行数を確かめて「実行」を押したときだけ受け付ける
+        if body.get('confirm') is not True:
+            raise HttpError(400, '確認が済んでいません')
+        opts = body.get('options') or {}
+        job = APP.jobs.start('csv_add', season, lambda job: tm_core.csv_add_rows(APP.store, season, opts, job))
         h.send_json({'job': job.as_dict()})
     elif kind == 'all_counts':
         h.send_json(tm_core.all_seasons_summary(APP.store))
