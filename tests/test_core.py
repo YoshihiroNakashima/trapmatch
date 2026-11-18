@@ -599,10 +599,10 @@ def test_season_spelling_is_canonical(tree, tmp_path):
 
 def test_added_row_uses_station_spelling_of_csv(tree, tmp_path):
     t = copy_tree(tree, tmp_path)
-    fixture.put(os.path.join(t['hdd'], fixture.SEASON, 'bsn0003', 'IMG_0002.AVI'), b'x')   # フォルダは小文字
-    os.rename(os.path.join(t['hdd'], fixture.SEASON, 'BSN0003', 'IMG_0001.AVI'),
-              os.path.join(t['hdd'], fixture.SEASON, 'bsn0003', 'IMG_0001.AVI'))
-    os.rmdir(os.path.join(t['hdd'], fixture.SEASON, 'BSN0003'))
+    # フォルダの名前を小文字にする（Windows のように大文字と小文字を区別しない場所でも同じ結果になるよう、名前の変更で行う）
+    os.rename(os.path.join(t['hdd'], fixture.SEASON, 'BSN0003'), os.path.join(t['hdd'], fixture.SEASON, 'bsn0003'))
+    assert 'bsn0003' in os.listdir(os.path.join(t['hdd'], fixture.SEASON))
+    fixture.put(os.path.join(t['hdd'], fixture.SEASON, 'bsn0003', 'IMG_0002.AVI'), b'x')
     store = make_store(tmp_path, t)
     scan(store)
     S = fixture.SEASON
